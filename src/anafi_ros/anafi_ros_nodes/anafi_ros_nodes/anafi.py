@@ -97,8 +97,8 @@ class Anafi(Node):
         self.node.create_subscription(GimbalCommand, 'gimbal/command', self.gimbal_callback, qos_profile_services_default)
 
         # Publishers
-        # self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile)
-        self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile_sensor_data)
+        self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile)
+        # self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile_sensor_data)
         self.pub_camera_info = self.node.create_publisher(CameraInfo, 'camera/camera_info', qos_profile)
         self.pub_time = self.node.create_publisher(Time, 'time', qos_profile)
         self.pub_attitude = self.node.create_publisher(QuaternionStamped, 'drone/attitude', qos_profile_sensor_data)
@@ -756,27 +756,59 @@ class Anafi(Node):
         self.node.get_logger().debug("Parameter 'camera/thermal/rendering' set to '%s'" % rendering_mode(int(self.thermal_rendering)))
 
     def yuv_frame_cb(self, yuv_frame):  # this function will be called by Olympe for each decoded YUV frame
+        cb_time = time.time()
+        
+        # 콜백 간격 측정 (프레임 도착 간격)
+        if hasattr(self, '_last_cb_time_for_log'):
+            cb_interval = (cb_time - self._last_cb_time_for_log) * 1000  # ms
+            if cb_interval > 50:  # 50ms 이상 간격이면 경고 (20fps 기준)
+                print(f'[WARN] Frame arrival gap: {cb_interval:.1f}ms (expected ~33ms for 30fps)')
+        self._last_cb_time_for_log = cb_time
+        
         yuv_frame.ref()
         if self.frame_queue.full():
-            self.frame_queue.get_nowait().unref()
-        self.frame_queue.put_nowait(yuv_frame)
+            old_item = self.frame_queue.get_nowait()
+            if isinstance(old_item, tuple):
+                old_item[0].unref()
+            else:
+                old_item.unref()
+            print('[WARN] Frame dropped due to full queue')
+        self.frame_queue.put_nowait((yuv_frame, cb_time))  # 콜백 시간도 함께 저장
 
     def flush_cb(self, stream):
         if stream["vdef_format"] != olympe.VDEF_I420:
             return True
         while not self.frame_queue.empty():
-            self.frame_queue.get_nowait().unref()
+            item = self.frame_queue.get_nowait()
+            if isinstance(item, tuple):
+                item[0].unref()
+            else:
+                item.unref()
         return True
 
     def yuv_frame_processing(self):
         cv_bridge = CvBridge()  # 루프 밖에서 1회 생성 (성능)
         self._last_frame_time = time.time()  # 워치독 기준 시각
+        frame_count = 0
+        last_log_time = time.time()
+        total_frames = 0
+        start_time = time.time()
 
         while rclpy.ok():
             try:
-                yuv_frame = self.frame_queue.get(timeout=0.1)
+                item = self.frame_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+
+            # 튜플로 저장된 경우 분리
+            if isinstance(item, tuple):
+                yuv_frame, cb_time = item
+            else:
+                yuv_frame = item
+                cb_time = time.time()
+
+            process_start = time.time()
+            frame_count += 1
 
             # 프레임 수신 표시 (워치독용)
             self._last_frame_time = time.time()
@@ -817,7 +849,24 @@ class Anafi(Node):
                     msg_image.header.stamp = self.node.get_clock().now().to_msg()
 
                 msg_image.header.frame_id = '/camera'
+                
+                publish_time = time.time()
                 self.pub_image.publish(msg_image)
+                
+                # 1초마다 타이밍 로그 출력
+                now = time.time()
+                if now - last_log_time >= 1.0:
+                    queue_delay = process_start - cb_time  # 콜백→처리 시작 지연
+                    process_time = publish_time - process_start  # 처리 시간
+                    total_delay = publish_time - cb_time  # 총 지연
+                    fps = frame_count / (now - (last_log_time - 1.0)) if frame_count > 0 else 0
+                    self.node.get_logger().info(
+                        f"Frame timing: queue_delay={queue_delay*1000:.1f}ms, "
+                        f"process={process_time*1000:.1f}ms, total={total_delay*1000:.1f}ms, "
+                        f"queue_size={self.frame_queue.qsize()}, fps={fps:.1f}"
+                    )
+                    last_log_time = now
+                    frame_count = 0
 
             except Exception as e:
                 self.node.get_logger().warn(f"image publish error: {e}")
