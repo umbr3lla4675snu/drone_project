@@ -114,7 +114,7 @@ class _Keyboard:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
 
-class AnafiSmartCamera(Node):
+class AnafiMoveByKeyboard(Node):
     def __init__(self):
         # /anafi 네임스페이스에 고정
         super().__init__('anafi_moveby_keyboard', namespace='/anafi')
@@ -343,7 +343,7 @@ class AnafiSmartCamera(Node):
 
 def main():
     rclpy.init()
-    node = AnafiSmartCamera()
+    node = AnafiMoveByKeyboard()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

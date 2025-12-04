@@ -97,8 +97,8 @@ class Anafi(Node):
         self.node.create_subscription(GimbalCommand, 'gimbal/command', self.gimbal_callback, qos_profile_services_default)
 
         # Publishers
-        self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile)
-        # self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile_sensor_data)
+        # self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile)
+        self.pub_image = self.node.create_publisher(Image, 'camera/image', qos_profile_sensor_data)
         self.pub_camera_info = self.node.create_publisher(CameraInfo, 'camera/camera_info', qos_profile)
         self.pub_time = self.node.create_publisher(Time, 'time', qos_profile)
         self.pub_attitude = self.node.create_publisher(QuaternionStamped, 'drone/attitude', qos_profile_sensor_data)
@@ -452,7 +452,7 @@ class Anafi(Node):
         self.drone.streaming.start(media_name=media_name)
         # self._streaming_start(media_name)
 
-        self.timer_streaming_watchdog = self.node.create_timer(1.0, self._streaming_watchdog)
+        self.timer_streaming_watchdog = self.node.create_timer(2.0, self._streaming_watchdog)
         
         self.processing_thread.start()
 
@@ -466,11 +466,11 @@ class Anafi(Node):
         self.drone.streaming.start(media_name=media_name)
 
     def _streaming_watchdog(self):
-        """최근 프레임이 1초 이상 없으면 pdraw를 재시작"""
+        """최근 프레임이 3초 이상 없으면 pdraw를 재시작"""
         now = time.time()
         last = getattr(self, "_last_frame_time", 0.0)
-        if now - last > 1.0:
-            self.node.get_logger().warn("No frames for >1s: restarting pdraw streaming")
+        if now - last > 2.0:  # 1초 → 2초로 증가
+            self.node.get_logger().warn("No frames for >2s: restarting pdraw streaming")
             media_name = "Front camera" if self.model == 'ai' else "DefaultVideo"
             try:
                 self._streaming_start(media_name)
@@ -756,59 +756,27 @@ class Anafi(Node):
         self.node.get_logger().debug("Parameter 'camera/thermal/rendering' set to '%s'" % rendering_mode(int(self.thermal_rendering)))
 
     def yuv_frame_cb(self, yuv_frame):  # this function will be called by Olympe for each decoded YUV frame
-        cb_time = time.time()
-        
-        # 콜백 간격 측정 (프레임 도착 간격)
-        if hasattr(self, '_last_cb_time_for_log'):
-            cb_interval = (cb_time - self._last_cb_time_for_log) * 1000  # ms
-            if cb_interval > 50:  # 50ms 이상 간격이면 경고 (20fps 기준)
-                print(f'[WARN] Frame arrival gap: {cb_interval:.1f}ms (expected ~33ms for 30fps)')
-        self._last_cb_time_for_log = cb_time
-        
         yuv_frame.ref()
         if self.frame_queue.full():
-            old_item = self.frame_queue.get_nowait()
-            if isinstance(old_item, tuple):
-                old_item[0].unref()
-            else:
-                old_item.unref()
-            print('[WARN] Frame dropped due to full queue')
-        self.frame_queue.put_nowait((yuv_frame, cb_time))  # 콜백 시간도 함께 저장
+            self.frame_queue.get_nowait().unref()
+        self.frame_queue.put_nowait(yuv_frame)
 
     def flush_cb(self, stream):
         if stream["vdef_format"] != olympe.VDEF_I420:
             return True
         while not self.frame_queue.empty():
-            item = self.frame_queue.get_nowait()
-            if isinstance(item, tuple):
-                item[0].unref()
-            else:
-                item.unref()
+            self.frame_queue.get_nowait().unref()
         return True
 
     def yuv_frame_processing(self):
         cv_bridge = CvBridge()  # 루프 밖에서 1회 생성 (성능)
         self._last_frame_time = time.time()  # 워치독 기준 시각
-        frame_count = 0
-        last_log_time = time.time()
-        total_frames = 0
-        start_time = time.time()
 
         while rclpy.ok():
             try:
-                item = self.frame_queue.get(timeout=0.1)
+                yuv_frame = self.frame_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-
-            # 튜플로 저장된 경우 분리
-            if isinstance(item, tuple):
-                yuv_frame, cb_time = item
-            else:
-                yuv_frame = item
-                cb_time = time.time()
-
-            process_start = time.time()
-            frame_count += 1
 
             # 프레임 수신 표시 (워치독용)
             self._last_frame_time = time.time()
@@ -823,18 +791,19 @@ class Anafi(Node):
 
             # 1) 항상 이미지 퍼블리시 (vmeta 없어도)
             try:
-                cv2_cvt_color_flag = {
-                    olympe.VDEF_I420: cv2.COLOR_YUV2BGR_I420,
-                    olympe.VDEF_NV12: cv2.COLOR_YUV2BGR_NV12,
-                }[yuv_frame.format()]
-
-                cv2frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv2_cvt_color_flag)
-
-                # 열화상 모드 컬러맵 (필요 모델에서만)
-                if self.model in {'thermal', 'usa'} and (getattr(self, 'thermal_rendering', 0) == 1):
-                    cv2frame = cv2.applyColorMap(cv2frame, cv2.COLORMAP_PLASMA)
-
-                msg_image = cv_bridge.cv2_to_imgmsg(cv2frame, encoding="bgr8")
+                # YUV 데이터에서 Y 채널(밝기)만 추출하여 그레이스케일로 publish
+                # cv2 변환 없이 직접 raw 데이터 사용
+                yuv_data = yuv_frame.as_ndarray()
+                
+                # I420 포맷: 전체 높이의 2/3가 Y 채널 (나머지는 U, V)
+                # yuv_data shape: (height * 1.5, width) for I420
+                total_height, width = yuv_data.shape
+                height = int(total_height * 2 / 3)  # Y 채널 높이
+                
+                # Y 채널만 추출 (처음 height 행)
+                y_plane = yuv_data[:height, :].copy()
+                
+                msg_image = cv_bridge.cv2_to_imgmsg(y_plane, encoding="mono8")
 
                 # 타임스탬프: NTP가 있으면 사용, 없으면 now()
                 ts = None
@@ -849,24 +818,7 @@ class Anafi(Node):
                     msg_image.header.stamp = self.node.get_clock().now().to_msg()
 
                 msg_image.header.frame_id = '/camera'
-                
-                publish_time = time.time()
                 self.pub_image.publish(msg_image)
-                
-                # 1초마다 타이밍 로그 출력
-                now = time.time()
-                if now - last_log_time >= 1.0:
-                    queue_delay = process_start - cb_time  # 콜백→처리 시작 지연
-                    process_time = publish_time - process_start  # 처리 시간
-                    total_delay = publish_time - cb_time  # 총 지연
-                    fps = frame_count / (now - (last_log_time - 1.0)) if frame_count > 0 else 0
-                    self.node.get_logger().info(
-                        f"Frame timing: queue_delay={queue_delay*1000:.1f}ms, "
-                        f"process={process_time*1000:.1f}ms, total={total_delay*1000:.1f}ms, "
-                        f"queue_size={self.frame_queue.qsize()}, fps={fps:.1f}"
-                    )
-                    last_log_time = now
-                    frame_count = 0
 
             except Exception as e:
                 self.node.get_logger().warn(f"image publish error: {e}")
