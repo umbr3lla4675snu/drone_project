@@ -25,7 +25,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger, SetBool
-from anafi_ros_interfaces.msg import MoveByCommand
+from anafi_ros_interfaces.msg import MoveByCommand, GimbalCommand, CameraCommand
 from yolo_msgs.msg import DetectionArray, Detection, KeyPoint2DArray
 
 
@@ -64,19 +64,37 @@ class PersonFollower(Node):
 
         # ---------- 파라미터 ----------
         self.declare_parameter('image_width', 1920)  # 카메라 이미지 가로 해상도
-        self.declare_parameter('center_deadzone', 100)  # 중심 허용 오차 (픽셀) - 더 민감하게
-        self.declare_parameter('move_step', 0.2)  # Y축 이동 스텝 (m) - 더 크게
-        self.declare_parameter('control_rate', 20.0)  # 제어 주기 (Hz) - 더 빠르게
+        self.declare_parameter('image_height', 1080)  # 카메라 이미지 세로 해상도
+        self.declare_parameter('center_deadzone', 10)  # 중심 허용 오차 (픽셀) - 더 민감하게
+        self.declare_parameter('move_step', 0.1)  # Y축 이동 스텝 (m) - 더 크게
+        self.declare_parameter('control_rate', 2.0)  # 제어 주기 (Hz) - 더 빠르게
         self.declare_parameter('no_target_timeout', 5.0)  # 타겟 없을 때 복귀 대기 시간 (초)
+        self.declare_parameter('gimbal_pitch_gain', 0.03)  # 짐벌 피치 게인 (deg/pixel)
+        self.declare_parameter('gimbal_deadzone', 10)  # 짐벌 제어 데드존 (픽셀)
+        self.declare_parameter('tracking_zoom', 1.2)  # 추적 중 줌 배율
+        self.declare_parameter('default_zoom', 1.0)  # 기본 줌 배율
 
         self.image_width = self.get_parameter('image_width').value
+        self.image_height = self.get_parameter('image_height').value
         self.center_deadzone = self.get_parameter('center_deadzone').value
         self.move_step = self.get_parameter('move_step').value
         self.control_rate = self.get_parameter('control_rate').value
         self.no_target_timeout = self.get_parameter('no_target_timeout').value
+        self.gimbal_pitch_gain = self.get_parameter('gimbal_pitch_gain').value
+        self.gimbal_deadzone = self.get_parameter('gimbal_deadzone').value
+        self.tracking_zoom = self.get_parameter('tracking_zoom').value
+        self.default_zoom = self.get_parameter('default_zoom').value
 
-        # 이미지 중심 X 좌표
+        # 이미지 중심 좌표
         self.image_center_x = self.image_width / 2.0
+        self.image_center_y = self.image_height / 2.0
+        
+        # 현재 짐벌 피치 각도 (마지막 전송값)
+        self.current_gimbal_pitch = 0.0
+        
+        # 현재 줌 상태
+        self.current_zoom = self.default_zoom
+        self.is_zoomed_in = False
 
         # ---------- 상태 변수 ----------
         self.is_flying = False
@@ -84,7 +102,7 @@ class PersonFollower(Node):
         self.target_person: Optional[Detection] = None
         self.last_detections: List[Detection] = []
 
-        # 이동 누적 추적 (이륙 지점 복귀용)
+        # 이동 누적 추적 (시작 위치 복귀용)
         self.total_dy = 0.0  # 이륙 이후 총 Y축 이동량
 
         # 타겟 없음 타이머
@@ -106,6 +124,12 @@ class PersonFollower(Node):
 
         # MoveBy 퍼블리셔
         self.pub_moveby = self.create_publisher(MoveByCommand, 'drone/moveby', qos_ctrl)
+
+        # Gimbal 퍼블리셔
+        self.pub_gimbal = self.create_publisher(GimbalCommand, 'gimbal/command', qos_ctrl)
+
+        # Camera 퍼블리셔 (줌)
+        self.pub_camera = self.create_publisher(CameraCommand, 'camera/command', qos_ctrl)
 
         # MoveBy 완료 구독
         self.sub_moveby_done = self.create_subscription(
@@ -133,6 +157,8 @@ class PersonFollower(Node):
 
         # 이동 중 플래그
         self.is_moving = False
+        self.move_start_time: Optional[float] = None
+        self.move_timeout = 3.0  # 이동 타임아웃 (초)
 
         self.get_logger().info("=" * 50)
         self.get_logger().info("Person Follower Node 시작")
@@ -200,14 +226,8 @@ class PersonFollower(Node):
         if not candidates:
             return None
 
-        # 가장 큰 사람 선택 (내림차순 정렬)
+        # 가장 큰 사람 선택
         candidates.sort(key=lambda x: x[1], reverse=True)
-        
-        # 로그: 후보들 크기 출력
-        if len(candidates) > 1:
-            sizes = [f"ID={c[0].id}:{c[1]:.0f}" for c in candidates]
-            self.get_logger().info(f"정면 타겟 {len(candidates)}명: {', '.join(sizes)} → 선택: ID={candidates[0][0].id}")
-        
         return candidates[0][0]
 
     def _find_tracked_person(self) -> Optional[Detection]:
@@ -229,9 +249,15 @@ class PersonFollower(Node):
         if not self.is_flying or not self.tracking_enabled:
             return
 
+        # 이동 타임아웃 체크
         if self.is_moving:
-            # 이전 이동 완료 대기
-            return
+            if self.move_start_time and (time.time() - self.move_start_time) > self.move_timeout:
+                self.get_logger().warn("이동 타임아웃 - 강제 해제")
+                self.is_moving = False
+                self.move_start_time = None
+            else:
+                # 이전 이동 완료 대기
+                return
 
         # 홈에서 대기 중이면 정면 타겟만 찾기
         if self.waiting_at_home:
@@ -264,14 +290,19 @@ class PersonFollower(Node):
             if self.tracking_id is not None:
                 self.get_logger().info(f"추적 대상 (ID={self.tracking_id}) 화면에서 사라짐")
                 self.tracking_id = None
+                self._zoom_out_to_default()  # 추적 해제 시 줌 아웃
 
             target = self._find_front_facing_person()
             if target is not None:
                 self.tracking_id = target.id
                 self.get_logger().warning(f"새 타겟 감지! ID={target.id}")
+                self._zoom_in_for_tracking()  # 새 타겟 추적 시 줌 인
 
         # 타겟 없음 처리
         if target is None:
+            # 줌 아웃 (타겟 없으면)
+            self._zoom_out_to_default()
+            
             if self.last_target_seen_time is None:
                 self.last_target_seen_time = current_time
 
@@ -279,7 +310,7 @@ class PersonFollower(Node):
             remaining = self.no_target_timeout - elapsed
 
             if elapsed >= self.no_target_timeout:
-                # 5초 이상 타겟 없음 → 이륙 지점 복귀
+                # 5초 이상 타깃 없음 → 시작 위치로 Y축 복귀
                 self._return_to_home()
             else:
                 self.get_logger().info(
@@ -290,9 +321,15 @@ class PersonFollower(Node):
             self.target_person = None
             return
 
+        # 타겟 발견 → 줌 인
+        self._zoom_in_for_tracking()
+
         # 타겟 발견 → 타이머 리셋
         self.last_target_seen_time = current_time
         self.target_person = target
+
+        # 짐벌로 얼굴 추적 (Y축)
+        self._control_gimbal(target)
 
         # 타겟의 X 좌표 (이미지에서)
         target_x = target.bbox.center.position.x
@@ -324,24 +361,26 @@ class PersonFollower(Node):
         self._publish_moveby(dy=dy)
         self.total_dy += dy  # 이동량 누적
         self.is_moving = True
+        self.move_start_time = time.time()
 
-    # ---------- 이륙 지점 복귀 ----------
+    # ---------- 시작 위치로 Y축 복귀 ----------
     def _return_to_home(self):
-        """이륙 지점으로 복귀 (누적 Y축 이동량 반대로)"""
+        """시작 위치로 복귀 (공중에서 Y축 이동만 되돌림)"""
         if abs(self.total_dy) < 0.1:
-            # 이미 홈 근처
-            self.get_logger().warning("이미 이륙 지점 근처, 대기 모드 진입")
+            # 이미 시작 위치 근처
+            self.get_logger().warning("이미 시작 위치 근처, 대기 모드 진입")
             self.waiting_at_home = True
             self.returning_home = False
             return
 
-        # 반대 방향으로 이동
+        # 반대 방향으로 Y축만 이동 (공중에서)
         return_dy = -self.total_dy
-        self.get_logger().warning(f"이륙 지점으로 복귀 (dy={return_dy:.2f}m)")
+        self.get_logger().warning(f"시작 위치로 Y축 복귀 (dy={return_dy:.2f}m, 공중 유지)")
 
         self.returning_home = True
-        self._publish_moveby(dy=return_dy)
+        self._publish_moveby(dy=return_dy)  # Y축만!
         self.is_moving = True
+        self.move_start_time = time.time()
 
     # ---------- MoveBy ----------
     def _publish_moveby(self, dx=0.0, dy=0.0, dz=0.0, dyaw=0.0):
@@ -352,15 +391,106 @@ class PersonFollower(Node):
         msg.dyaw = float(dyaw)
         self.pub_moveby.publish(msg)
 
+    # ---------- Gimbal 제어 ----------
+    def _get_face_center_y(self, detection: Detection) -> Optional[float]:
+        """얼굴 중심 Y좌표 추출 (코 또는 눈 위치 사용)"""
+        if not detection.keypoints or not detection.keypoints.data:
+            # 키포인트 없으면 bbox 상단 1/3 지점 사용
+            return detection.bbox.center.position.y - detection.bbox.size.y * 0.2
+        
+        keypoints = detection.keypoints.data
+        
+        # 코(id=1) 또는 눈(id=2,3) 위치 찾기
+        face_y_points = []
+        for kp in keypoints:
+            if kp.id in [1, 2, 3] and kp.score > 0.5:  # nose, left_eye, right_eye
+                face_y_points.append(kp.point.y)
+        
+        if face_y_points:
+            return sum(face_y_points) / len(face_y_points)
+        
+        # 얼굴 키포인트 없으면 bbox 상단 사용
+        return detection.bbox.center.position.y - detection.bbox.size.y * 0.2
+
+    def _control_gimbal(self, target: Detection):
+        """타겟의 얼굴 위치에 맞게 짐벌 피치 조정"""
+        face_y = self._get_face_center_y(target)
+        if face_y is None:
+            return
+        
+        # 이미지 중심과의 Y 오차 (위로 가면 음수, 아래로 가면 양수)
+        error_y = face_y - self.image_center_y
+        
+        self.get_logger().info(f"얼굴Y={face_y:.0f}, 중심Y={self.image_center_y:.0f}, 오차={error_y:.0f}px")
+        
+        # 데드존 내면 조정 안 함
+        if abs(error_y) < self.gimbal_deadzone:
+            self.get_logger().info(f"짐벌 데드존 내 (오차 {error_y:.0f} < {self.gimbal_deadzone})")
+            return
+        
+        # 목표 피치 각도 계산 (이미지에서 아래에 있으면 카메라를 아래로)
+        # 이미지 Y+ = 아래, 짐벌 pitch+ = 아래 (Anafi)
+        # error_y를 피치 각도로 직접 변환 (절대 각도)
+        target_pitch = error_y * self.gimbal_pitch_gain
+        
+        # 피치 범위 제한 (-90 ~ +30)
+        target_pitch = max(-90.0, min(30.0, target_pitch))
+        
+        self.get_logger().info(f"짐벌 피치: {target_pitch:.1f}° (오차 {error_y:.0f}px → 위쪽" if error_y < 0 else f"짐벌 피치: {target_pitch:.1f}° (오차 {error_y:.0f}px → 아래쪽)")
+        
+        # 변화가 있으면 명령 전송
+        if abs(target_pitch - self.current_gimbal_pitch) > 0.5:
+            self.current_gimbal_pitch = target_pitch
+            self._publish_gimbal(pitch=target_pitch)
+            self.get_logger().warning(f">>> 짐벌 명령 전송: pitch={target_pitch:.1f}°")
+
+    def _publish_gimbal(self, roll=0.0, pitch=0.0, yaw=0.0):
+        """짐벌 명령 퍼블리시 (상대 각도 - 드론 기준)"""
+        msg = GimbalCommand()
+        msg.mode = 0  # position mode
+        msg.frame = 1  # relative frame (드론 기준) - absolute(2)면 드론 yaw에 영향줄 수 있음
+        msg.roll = float(roll)
+        msg.pitch = float(pitch)
+        msg.yaw = 0.0  # yaw는 항상 0으로 고정 (드론 회전 방지)
+        self.pub_gimbal.publish(msg)
+
+    # ---------- 줌 제어 ----------
+    def _set_zoom(self, zoom_level: float):
+        """카메라 줌 설정"""
+        if abs(self.current_zoom - zoom_level) < 0.05:
+            return  # 변화 없으면 무시
+        
+        self.current_zoom = zoom_level
+        msg = CameraCommand()
+        msg.mode = 0  # level mode (절대값)
+        msg.zoom = float(zoom_level)
+        self.pub_camera.publish(msg)
+        self.get_logger().info(f"줌: {zoom_level:.1f}x")
+
+    def _zoom_in_for_tracking(self):
+        """추적 시작 시 줌 인 (임시 비활성화)"""
+        pass  # 줌 임시 비활성화
+        # if not self.is_zoomed_in:
+        #     self._set_zoom(self.tracking_zoom)
+        #     self.is_zoomed_in = True
+
+    def _zoom_out_to_default(self):
+        """추적 해제 시 줌 아웃 (임시 비활성화)"""
+        pass  # 줌 임시 비활성화
+        # if self.is_zoomed_in:
+        #     self._set_zoom(self.default_zoom)
+        #     self.is_zoomed_in = False
+
     def _on_moveby_done(self, msg: Bool):
         self.is_moving = False
+        self.move_start_time = None
 
         if self.returning_home:
             # 복귀 완료
             self.returning_home = False
             self.total_dy = 0.0  # 이동량 리셋
             self.waiting_at_home = True
-            self.get_logger().warning("이륙 지점 복귀 완료! 정면 타겟 대기 중...")
+            self.get_logger().warning("시작 위치 복귀 완료! 정면 타깃 대기 중...")
             return
 
         if msg.data:
@@ -431,16 +561,24 @@ class PersonFollower(Node):
             self.returning_home = False
             self.waiting_at_home = False
             self.tracking_id = None  # 새로 정면 타겟 찾기
+            # 짐벌 초기화 (정면 0도)
+            self.current_gimbal_pitch = 0.0
+            self._publish_gimbal(pitch=0.0)
+            # 줌 초기화
+            self.is_zoomed_in = False
+            self._set_zoom(self.default_zoom)
 
         elif ch == 'l':
             self.get_logger().warning("착륙 요청")
             self.tracking_enabled = False
+            self._zoom_out_to_default()  # 착륙 시 줌 아웃
             self._call_trigger(self.cli_land, 'land')
             self.is_flying = False
 
         elif ch == 'k':
             self.get_logger().error("긴급 정지!")
             self.tracking_enabled = False
+            self._zoom_out_to_default()  # 정지 시 줌 아웃
             self._call_trigger(self.cli_halt, 'halt')
             self.is_flying = False
 

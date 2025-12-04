@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'anafi_keyboard_control = anafi_ai.anafi_keyboard_control:main',
             'person_follower = anafi_ai.person_follower:main',
+            'person_counter = anafi_ai.person_counter:main',
         ],
     },
 )

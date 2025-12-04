@@ -59,7 +59,7 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("enable", True)
         self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
 
-        self.declare_parameter("threshold", 0.5)
+        self.declare_parameter("threshold", 0.7)
         self.declare_parameter("iou", 0.5)
         self.declare_parameter("imgsz_height", 640)
         self.declare_parameter("imgsz_width", 640)
