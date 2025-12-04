@@ -1,3 +1,4 @@
+*.pt
 install/
 log/
 cache/

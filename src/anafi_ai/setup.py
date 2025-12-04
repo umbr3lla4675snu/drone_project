@@ -10,7 +10,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # ('share/' + package_name + '/launch', ['launch/anafi_bridge.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'anafi_keyboard_control = anafi_ai.anafi_keyboard_control:main',
+            'person_follower = anafi_ai.person_follower:main',
         ],
     },
 )
