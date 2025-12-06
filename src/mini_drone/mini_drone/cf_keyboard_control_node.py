@@ -155,7 +155,7 @@ class CfKeyboardTeleop(Node):
             ('/cf/emergency_stop', self.cli_emerg),
         ]:
             if not cli.service_is_ready():
-                self.get_logger().warn(f'Service not ready yet: {name}')
+                self.get_logger().warn(f'Service not ready yet: {name}\r')
 
     def _status_timer(self):
         with self._lock:
@@ -177,10 +177,10 @@ class CfKeyboardTeleop(Node):
 
         if have_odom:
             self.get_logger().info(
-                f'POS (map): x={x:.2f} y={y:.2f} z={z:.2f} yaw={math.degrees(yaw):.1f} deg'
+                f'POS (map): x={x:.2f} y={y:.2f} z={z:.2f} yaw={math.degrees(yaw):.1f} deg\r'
             )
         if v is not None:
-            self.get_logger().info(f'Battery: {v:.2f} V')
+            self.get_logger().info(f'Battery: {v:.2f} V\r')
         # 카메라 스트림 상태
         # self.get_logger().info(f'Camera FPS (approx): {cam_fps:.2f} Hz')
 
@@ -202,12 +202,12 @@ class CfKeyboardTeleop(Node):
 
         self.pub_goto.publish(msg)
         self.get_logger().info(
-            f'GOTO → x={target_x:.2f}, y={target_y:.2f}, z={target_z:.2f}, yaw={math.degrees(target_yaw):.1f}deg'
+            f'GOTO → x={target_x:.2f}, y={target_y:.2f}, z={target_z:.2f}, yaw={math.degrees(target_yaw):.1f}deg\r'
         )
 
     def _call_trigger_async(self, cli: rclpy.client.Client, name: str):
         if not cli.service_is_ready():
-            self.get_logger().warn(f'Service not ready: {name}')
+            self.get_logger().warn(f'Service not ready: {name}\r')
             return
         req = Trigger.Request()
         future = cli.call_async(req)
@@ -216,9 +216,9 @@ class CfKeyboardTeleop(Node):
         def _done_cb(fut):
             try:
                 resp = fut.result()
-                self.get_logger().info(f'{name} → success={resp.success}, msg="{resp.message}"')
+                self.get_logger().info(f'{name} → success={resp.success}, msg="{resp.message}"\r')
             except Exception as e:
-                self.get_logger().error(f'{name} call failed: {e}')
+                self.get_logger().error(f'{name} call failed: {e}\r')
 
         future.add_done_callback(_done_cb)
 
@@ -237,7 +237,7 @@ class CfKeyboardTeleop(Node):
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setraw(fd)
-            self.get_logger().info('Keyboard teleop started. Press h for help.')
+            self.get_logger().info('Keyboard teleop started. Press h for help.\r')
 
             while rclpy.ok():
                 key = self._get_key(timeout=0.1)
@@ -261,21 +261,21 @@ class CfKeyboardTeleop(Node):
             return
 
         if key == 't':
-            self.get_logger().info('[KEY] Takeoff')
+            self.get_logger().info('[KEY] Takeoff\r')
             msg = Float32()
             msg.data = 0.4  # 원하는 takeoff 높이(m)
             self.pub_takeoff.publish(msg)
             return
 
         if key == 'l':
-            self.get_logger().info('[KEY] Land')
+            self.get_logger().info('[KEY] Land\r')
             msg = Float32()
             msg.data = 0.0
             self.pub_land.publish(msg)
             return
 
         if key == ' ':
-            self.get_logger().warn('[KEY] EMERGENCY STOP')
+            self.get_logger().warn('[KEY] EMERGENCY STOP\r')
             self._call_trigger_async(self.cli_emerg, '/cf/emergency_stop')
             return
 
@@ -288,7 +288,7 @@ class CfKeyboardTeleop(Node):
                 x, y, z, yaw = self._x, self._y, self._z, self._yaw
 
         if not have_odom:
-            self.get_logger().warn('No /cf/odom yet, cannot move. Wait for odom.')
+            self.get_logger().warn('No /cf/odom yet, cannot move. Wait for odom.\r')
             return
 
         target_x, target_y, target_z, target_yaw = x, y, z, yaw
@@ -317,7 +317,7 @@ class CfKeyboardTeleop(Node):
             dyaw = -self.step_yaw
         elif key == 'x':
             # 현재 위치로 hover: goto 현재 위치 (yaw 유지)
-            self.get_logger().info('[KEY] Hover at current pose')
+            self.get_logger().info('[KEY] Hover at current pose\r')
             self._send_goto(x, y, z, yaw)
             return
         else:
@@ -356,7 +356,7 @@ Ctrl+C  : exit
 =====================================
 """
         print(msg)
-        self.get_logger().info('Help printed')
+        self.get_logger().info('Help printed\r')
 
 
 def main(args=None):

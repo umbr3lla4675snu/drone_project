@@ -9,7 +9,7 @@ def generate_launch_description():
             name='cf_bridge',
             output='screen',
             parameters=[{
-                'uri': 'radio://0/80/2M/E7E7E7E701',
+                'uri': 'radio://0/80/2M/E7E7E7E706',
                 'period_ms': 100,
                 'publish_rate_hz': 20.0,
                 'use_state_estimate': True

@@ -222,7 +222,7 @@ class Anafi(Node):
                                                         floating_point_range=[FloatingPointRange(from_value=0.1,
                                                                                                  to_value=4.0,
                                                                                                  step=0.0)]))
-        self.node.declare_parameter("drone/max_horizontal_speed", 4.0,  # 좌우 이동 속도 증가
+        self.node.declare_parameter("drone/max_horizontal_speed", 10.0,  # 좌우 이동 속도 증가
                                     ParameterDescriptor(description="Max horizontal speed (in m/s) [0.1, 15.0]",
                                                         floating_point_range=[FloatingPointRange(from_value=0.1,
                                                                                                  to_value=15.0,
@@ -1304,15 +1304,16 @@ class Anafi(Node):
                     media_info = olympe.Media.media_info(self.drone.media, media_id = media)
                     self.node.get_logger().info("Media %i/%i: downloading %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
                     media_download = self.drone(download_media(media))
-                    resources = media_download.as_completed(timeout=100)
-                    self.node.get_logger().info("Media %i/%i: downloaded %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
-
-                    for resource in resources:
-                        if not resource.success():
-                            self.node.get_logger().error("Failed to download %s" % str(resource.resource_id))
-                            continue
+                    
+                    # as_completed()의 결과를 리스트로 변환하여 무한루프 방지
+                    if media_download.wait(_timeout=100).success():
+                        self.node.get_logger().info("Media %i/%i: downloaded %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
+                    else:
+                        self.node.get_logger().error("Failed to download media %s" % str(media))
 
                     media_count += 1
+
+                self.drone(delete_all_media()).wait()
 
                 if request.data:  # cut media
                     self.drone(delete_all_media())
@@ -1333,7 +1334,7 @@ class Anafi(Node):
             self.node.get_logger().info("Formatting media %s (%.1fGB)" % (info['name'], info['capacity']/(2**30)))
             self.drone(olympe.messages.user_storage.format_with_type(  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.format_with_type
                 label="",
-                type=olympe.enums.user_storage.formatting_type(0))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.enums.user_storage.formatting_type
+                type=olympe.enums.user_storage.formatting_type(1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.enums.user_storage.formatting_type
                 >>
                 olympe.messages.user_storage.start_monitoring(period=1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.start_monitoring
         else:

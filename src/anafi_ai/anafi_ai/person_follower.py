@@ -10,6 +10,8 @@ Person Follower Node for Parrot Anafi
   l : 착륙
   k : 긴급 정지
   스페이스 : 추적 일시정지/재개
+  r : 녹화 시작/중단
+  d : 녹화 파일 다운로드
 """
 
 import sys
@@ -26,6 +28,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger, SetBool
 from anafi_ros_interfaces.msg import MoveByCommand, GimbalCommand, CameraCommand
+from anafi_ros_interfaces.srv import Recording
 from yolo_msgs.msg import DetectionArray, Detection, KeyPoint2DArray
 
 
@@ -65,9 +68,10 @@ class PersonFollower(Node):
         # ---------- 파라미터 ----------
         self.declare_parameter('image_width', 1920)  # 카메라 이미지 가로 해상도
         self.declare_parameter('image_height', 1080)  # 카메라 이미지 세로 해상도
-        self.declare_parameter('center_deadzone', 200)  # 중심 허용 오차 (픽셀) - 더 민감하게
-        self.declare_parameter('move_step', 0.2)  # Y축 이동 스텝 (m) - 더 크게
-        self.declare_parameter('control_rate', 1.0)  # 제어 주기 (Hz) - 더 빠르게
+        self.declare_parameter('center_deadzone', 120)  # 중심 허용 오차 (픽셀) - 더 민감하게
+        self.declare_parameter('move_step', 0.12)  # Y축 이동 기본 스텝 (m)
+        self.declare_parameter('move_step_max', 1.0)  # Y축 이동 최대 스텝 (m)
+        self.declare_parameter('control_rate', 4.0)  # 제어 주기 (Hz) - 더 빠르게
         self.declare_parameter('no_target_timeout', 5.0)  # 타겟 없을 때 복귀 대기 시간 (초)
         self.declare_parameter('gimbal_pitch_gain', 0.03)  # 짐벌 피치 게인 (deg/pixel)
         self.declare_parameter('gimbal_deadzone', 60)  # 짐벌 제어 데드존 (픽셀)
@@ -78,6 +82,7 @@ class PersonFollower(Node):
         self.image_height = self.get_parameter('image_height').value
         self.center_deadzone = self.get_parameter('center_deadzone').value
         self.move_step = self.get_parameter('move_step').value
+        self.move_step_max = self.get_parameter('move_step_max').value
         self.control_rate = self.get_parameter('control_rate').value
         self.no_target_timeout = self.get_parameter('no_target_timeout').value
         self.gimbal_pitch_gain = self.get_parameter('gimbal_pitch_gain').value
@@ -144,6 +149,12 @@ class PersonFollower(Node):
         self.cli_land = self.create_client(Trigger, 'drone/land')
         self.cli_halt = self.create_client(Trigger, 'drone/halt')
         self.cli_offboard = self.create_client(SetBool, 'skycontroller/offboard')
+        self.cli_record_start = self.create_client(Recording, 'camera/recording/start')
+        self.cli_record_stop = self.create_client(Recording, 'camera/recording/stop')
+        self.cli_download = self.create_client(SetBool, 'storage/download')
+
+        # 녹화 상태
+        self.is_recording = False
 
         # ---------- 키보드 ----------
         self._kb = None
@@ -169,6 +180,8 @@ class PersonFollower(Node):
         self.get_logger().info("  l : 착륙")
         self.get_logger().info("  k : 긴급 정지")
         self.get_logger().info("  스페이스 : 추적 일시정지/재개")
+        self.get_logger().info("  r : 녹화 시작/중단")
+        self.get_logger().info("  d : 녹화 파일 다운로드")
         self.get_logger().info(f"  정면 타겟 없으면 {self.no_target_timeout}초 후 이륙지점 복귀")
         self.get_logger().info("=" * 50)
 
@@ -350,14 +363,17 @@ class PersonFollower(Node):
             self.get_logger().info("타겟이 중심에 있음 ✓")
             return
 
-        # Y축 이동 방향 결정
-        # 이미지에서 오른쪽(+x) → 드론 오른쪽(+dy) 이동
-        # 이미지에서 왼쪽(-x) → 드론 왼쪽(-dy) 이동
+        # Y축 이동 방향 및 크기 결정 (오차 클수록 스텝 증가, 최대 move_step_max)
+        error_mag = abs(error_x)
+        ratio = error_mag / self.center_deadzone if self.center_deadzone > 0 else 1.0
+        scale = max(1.0, ratio)
+        dy_mag = min(self.move_step_max, self.move_step * scale)
+
         if error_x > 0:
-            dy = self.move_step  # 오른쪽 이동
+            dy = dy_mag  # 오른쪽 이동
             direction = "오른쪽"
         else:
-            dy = -self.move_step  # 왼쪽 이동
+            dy = -dy_mag  # 왼쪽 이동
             direction = "왼쪽"
 
         if(self.total_dy + dy > 10 or self.total_dy + dy < -10):
@@ -500,6 +516,8 @@ class PersonFollower(Node):
 
     def _on_moveby_done(self, msg: Bool):
         self.is_moving = False
+        if self.move_start_time is not None:
+            self.get_logger().info(f"Move time : {time.time() - self.move_start_time}")
         self.move_start_time = None
         
         # 초기 상승 완료 후 추적 시작
@@ -616,12 +634,17 @@ class PersonFollower(Node):
                         self.is_zoomed_in = False
                         self._set_zoom(self.default_zoom)
                         
+                        # 이륙 후 녹화 시작
+                        if not self.is_recording:
+                            self.is_recording = True
+                            self._start_recording()
+                        
                         # +0.2m 상승 명령 발행 및 대기 플래그 설정
                         
                         time.sleep(5)
                         self.get_logger().info("상승 명령 (dz=+0.2m) 발행")
                         self.waiting_for_initial_ascent = True
-                        self._publish_moveby(dz=-0.2)
+                        self._publish_moveby(dz=-0.4)
                     else:
                         self.get_logger().error(f"이륙 실패: {resp.message if resp else 'unknown error'}")
                         self.is_flying = False
@@ -637,8 +660,15 @@ class PersonFollower(Node):
             self.get_logger().warning("착륙 요청")
             self.tracking_enabled = False
             self._zoom_out_to_default()  # 착륙 시 줌 아웃
+            
+            # 착륙 전 녹화 중단
+            if self.is_recording:
+                self.is_recording = False
+                self._stop_recording()
+            
             self._call_trigger(self.cli_land, 'land')
             self.is_flying = False
+            self._download_media()
 
         elif ch == 'k':
             self.get_logger().error("긴급 정지!")
@@ -659,6 +689,106 @@ class PersonFollower(Node):
         elif ch == 'n':
             self.get_logger().info("수동으로 위로 이동")
             self._publish_moveby(dz=0.2)
+
+        # elif ch == 'r':
+        #     self.is_recording = not self.is_recording
+        #     if self.is_recording:
+        #         self._start_recording()
+        #     else:
+        #         self._stop_recording()
+
+        elif ch == 'd':
+            self._download_media()
+
+
+    # ---------- 녹화 제어 ----------
+    def _start_recording(self):
+        """녹화 시작"""
+        if not self.cli_record_start.service_is_ready():
+            self.get_logger().info("camera/recording/start 서비스 대기 중...")
+            if not self.cli_record_start.wait_for_service(timeout_sec=3.0):
+                self.get_logger().error("camera/recording/start 서비스 없음")
+                self.is_recording = False
+                return
+
+        try:
+            from anafi_ros_interfaces.srv import Recording
+            req = Recording.Request()
+            # Recording.srv expects uint8 enums, not strings
+            req.mode = 0         # standard
+            req.resolution = 3   # 1920x1080 (Full HD)
+            req.framerate = 2    # 30 fps
+            req.hyperlapse = 1   # 1/30 (기본값)
+            
+            fut = self.cli_record_start.call_async(req)
+
+            def _done(_):
+                try:
+                    resp = fut.result()
+                    self.get_logger().warning("✅ 녹화 시작")
+                except Exception as e:
+                    self.get_logger().error(f"녹화 시작 오류: {e}")
+                    self.is_recording = False
+
+            fut.add_done_callback(_done)
+        except Exception as e:
+            self.get_logger().error(f"녹화 시작 요청 오류: {e}")
+            self.is_recording = False
+
+    def _stop_recording(self):
+        """녹화 중단"""
+        if not self.cli_record_stop.service_is_ready():
+            self.get_logger().info("camera/recording/stop 서비스 대기 중...")
+            if not self.cli_record_stop.wait_for_service(timeout_sec=3.0):
+                self.get_logger().error("camera/recording/stop 서비스 없음")
+                self.is_recording = True
+                return
+
+        try:
+            from anafi_ros_interfaces.srv import Recording
+            req = Recording.Request()
+            
+            fut = self.cli_record_stop.call_async(req)
+
+            def _done(_):
+                try:
+                    resp = fut.result()
+                    self.get_logger().warning("⏹️ 녹화 중단")
+                except Exception as e:
+                    self.get_logger().error(f"녹화 중단 오류: {e}")
+                    self.is_recording = True
+
+            fut.add_done_callback(_done)
+        except Exception as e:
+            self.get_logger().error(f"녹화 중단 요청 오류: {e}")
+            self.is_recording = True
+
+    # ---------- 미디어 다운로드 ----------
+    def _download_media(self):
+        """녹화된 미디어 파일 다운로드"""
+        if not self.cli_download.service_is_ready():
+            self.get_logger().info("camera/download_media 서비스 대기 중...")
+            if not self.cli_download.wait_for_service(timeout_sec=3.0):
+                self.get_logger().error("camera/download_media 서비스 없음")
+                return
+
+        try:
+            fut = self.cli_download.call_async(SetBool.Request())
+
+            def _done(_):
+                try:
+                    resp = fut.result()
+                    if resp and resp.success:
+                        self.get_logger().warning(f"✅ 다운로드 완료: {resp.message}")
+                        self.get_logger().warning("파일 위치: ~/Pictures/Anafi")
+                    else:
+                        self.get_logger().error(f"다운로드 실패: {resp.message if resp else 'unknown error'}")
+                except Exception as e:
+                    self.get_logger().error(f"다운로드 오류: {e}")
+
+            fut.add_done_callback(_done)
+        except Exception as e:
+            self.get_logger().error(f"다운로드 요청 오류: {e}")
 
 
 def main():

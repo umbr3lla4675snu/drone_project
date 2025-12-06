@@ -1,3 +1,6 @@
 ros2 launch anafi_ros_nodes anafi_launch.py
 ros2 launch yolo_bringup yolo.launch.py input_image_topic:=/anafi/camera/image
 ros2 run anafi_ai person_follower
+
+ros2 launch mini_drone crazyflie_bridge.launch.py
+ros2 run mini_drone person_counter

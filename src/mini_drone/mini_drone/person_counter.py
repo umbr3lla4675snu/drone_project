@@ -21,7 +21,9 @@ import select
 
 import cv2
 import time
+from functools import partial
 from cv_bridge import CvBridge
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -29,6 +31,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image
 from std_msgs.msg import Int32, Float32
+from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
 
 from ultralytics import YOLO
@@ -63,10 +66,11 @@ class PersonCounter(Node):
         self.declare_parameter('image_topic', '/camera/image')
         self.declare_parameter('model', 'yolo11n.pt')  # 가벼운 모델 사용
         self.declare_parameter('device', 'cuda:0')
-        self.declare_parameter('threshold', 0.3)
+        self.declare_parameter('threshold', 0.5)
         self.declare_parameter('publish_rate', 1.0)  # Hz
-        self.declare_parameter('takeoff_height', 1.0)  # m
+        self.declare_parameter('takeoff_height', 1.5)  # m
         self.declare_parameter('stabilize_sec', 5.0)  # 감지 변화 확정 대기 시간
+        self.declare_parameter('world_frame', 'map')
 
         self.image_topic = self.get_parameter('image_topic').value
         self.model_path = self.get_parameter('model').value
@@ -75,6 +79,7 @@ class PersonCounter(Node):
         self.publish_rate = self.get_parameter('publish_rate').value
         self.takeoff_height = float(self.get_parameter('takeoff_height').value)
         self.stabilize_sec = float(self.get_parameter('stabilize_sec').value)
+        self.world_frame = self.get_parameter('world_frame').value
 
         # ---------- YOLO 모델 로드 ----------
         self.get_logger().info(f"YOLO 모델 로드 중: {self.model_path}")
@@ -91,6 +96,10 @@ class PersonCounter(Node):
         self.stable_count = 0  # 내부 확정 카운트
         self._pending_count = 0
         self._pending_since = None
+        self.bounce_delta = 0.3  # stable 감소 시 상하 진동 크기 (m)
+        self._bounce_timer = None
+        self._bounce_active = False
+        self._is_takeoff = False
 
         # ---------- QoS ----------
         qos_image = QoSProfile(
@@ -114,6 +123,7 @@ class PersonCounter(Node):
         self.pub_count_stable = self.create_publisher(Int32, '/person_count_stable', qos_pub)  # 확정 카운트
         self.pub_takeoff = self.create_publisher(Float32, '/cf/hl/takeoff', qos_pub)
         self.pub_land = self.create_publisher(Float32, '/cf/hl/land', qos_pub)
+        self.pub_goto    = self.create_publisher(PoseStamped, '/cf/hl/goto', qos_pub)
 
         # ---------- Service Clients ----------
         self.cli_stop = self.create_client(Trigger, '/cf/stop')
@@ -183,20 +193,22 @@ class PersonCounter(Node):
             msg = Int32(); msg.data = count
             self.pub_count.publish(msg)
 
-            # 안정화 로직: 감지 수 변화가 5초 유지되면 내부 카운트 변경
+            # 안정화 로직: 감지 수가 5초 이상 유지되면 stable count 갱신
             now = time.time()
             if count != self._pending_count:
+                # 새로운 count 값이 감지되면 pending 시작
                 self._pending_count = count
                 self._pending_since = now
             else:
+                # 동일한 count가 stabilize_sec 이상 유지되면 stable_count 갱신
                 if self._pending_since is not None and (now - self._pending_since) >= self.stabilize_sec:
-                    diff = self._pending_count - self.stable_count
-                    if diff == 1:
-                        self.stable_count += 1
-                        self.get_logger().warning(f"확정 카운트 +1 → {self.stable_count}")
-                    elif diff == -1:
-                        self.stable_count -= 1
-                        self.get_logger().warning(f"확정 카운트 -1 → {self.stable_count}")
+                    if self._pending_count != self.stable_count:
+                        old_stable = self.stable_count
+                        self.stable_count = self._pending_count
+                        diff = self.stable_count - old_stable
+                        self.get_logger().warning(f"확정 카운트 갱신: {old_stable} → {self.stable_count} (변화량: {diff:+d})")
+                        if diff < 0:
+                            self._trigger_bounce()
                     # 변화 반영 후 pending 초기화
                     self._pending_since = None
 
@@ -212,6 +224,55 @@ class PersonCounter(Node):
         except Exception as e:
             self.get_logger().error(f"처리 오류: {e}")
 
+    def _send_goto(self, target_x, target_y, target_z, target_yaw):
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.world_frame
+        msg.pose.position.x = float(target_x)
+        msg.pose.position.y = float(target_y)
+        msg.pose.position.z = float(target_z)
+
+        # yaw만 반영 (roll, pitch=0)
+        cy = math.cos(target_yaw * 0.5)
+        sy = math.sin(target_yaw * 0.5)
+        msg.pose.orientation.z = sy
+        msg.pose.orientation.w = cy
+        msg.pose.orientation.x = 0.0
+        msg.pose.orientation.y = 0.0
+
+        self.pub_goto.publish(msg)
+        self.get_logger().info(
+            f'GOTO → x={target_x:.2f}, y={target_y:.2f}, z={target_z:.2f}, yaw={math.degrees(target_yaw):.1f}deg\r'
+        )
+
+    def _finish_bounce(self, target_height: float):
+        # 하강 명령 후 타이머 해제
+        self._send_goto(0, 0, target_height, 0)
+        self.get_logger().warning(f"stable 감소 대응: 하강 → {target_height:.2f} m")
+        if self._bounce_timer is not None:
+            self._bounce_timer.cancel()
+            self._bounce_timer = None
+        self._bounce_active = False
+
+    def _trigger_bounce(self):
+        """stable count 감소 시 0.5m 상하 진동."""
+        if self._bounce_active or not self._is_takeoff:
+            return
+        self._bounce_active = True
+
+        base = max(0.1, float(self.takeoff_height))
+        up = max(0.1, base + self.bounce_delta)
+
+        # 즉시 상승 후, 1초 뒤 하강
+        self._send_goto(0, 0, up, 0)
+
+        self.get_logger().warning(f"stable 감소 대응: 상승 → {up:.2f} m (기준 {base:.2f} m)")
+
+        self._bounce_timer = self.create_timer(
+            5.0,
+            partial(self._finish_bounce, base),
+        )
+
     # ---------- 키보드 처리 ----------
     def _keyboard_tick(self):
         ch = self._kb.getch()
@@ -222,11 +283,13 @@ class PersonCounter(Node):
             msg = Float32()
             msg.data = float(self.takeoff_height)
             self.pub_takeoff.publish(msg)
+            self._is_takeoff = True
             self.get_logger().warning(f"takeoff 명령 발행: {msg.data:.2f} m")
         elif ch == 'l':
             msg = Float32()
             msg.data = 0.0
             self.pub_land.publish(msg)
+            self._is_takeoff = False
             self.get_logger().warning("land 명령 발행")
         elif ch == 'k':
             if not self.cli_stop.service_is_ready():
@@ -247,6 +310,8 @@ class PersonCounter(Node):
                     self.get_logger().error(f"EMERGENCY STOP 오류: {e}")
 
             fut.add_done_callback(_done)
+        elif ch == 'b':
+            self._trigger_bounce()
 
 
 def main():
