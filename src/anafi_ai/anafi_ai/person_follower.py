@@ -65,12 +65,12 @@ class PersonFollower(Node):
         # ---------- 파라미터 ----------
         self.declare_parameter('image_width', 1920)  # 카메라 이미지 가로 해상도
         self.declare_parameter('image_height', 1080)  # 카메라 이미지 세로 해상도
-        self.declare_parameter('center_deadzone', 10)  # 중심 허용 오차 (픽셀) - 더 민감하게
-        self.declare_parameter('move_step', 0.1)  # Y축 이동 스텝 (m) - 더 크게
-        self.declare_parameter('control_rate', 2.0)  # 제어 주기 (Hz) - 더 빠르게
+        self.declare_parameter('center_deadzone', 200)  # 중심 허용 오차 (픽셀) - 더 민감하게
+        self.declare_parameter('move_step', 0.2)  # Y축 이동 스텝 (m) - 더 크게
+        self.declare_parameter('control_rate', 1.0)  # 제어 주기 (Hz) - 더 빠르게
         self.declare_parameter('no_target_timeout', 5.0)  # 타겟 없을 때 복귀 대기 시간 (초)
         self.declare_parameter('gimbal_pitch_gain', 0.03)  # 짐벌 피치 게인 (deg/pixel)
-        self.declare_parameter('gimbal_deadzone', 10)  # 짐벌 제어 데드존 (픽셀)
+        self.declare_parameter('gimbal_deadzone', 60)  # 짐벌 제어 데드존 (픽셀)
         self.declare_parameter('tracking_zoom', 1.2)  # 추적 중 줌 배율
         self.declare_parameter('default_zoom', 1.0)  # 기본 줌 배율
 
@@ -112,6 +112,9 @@ class PersonFollower(Node):
 
         # 현재 추적 중인 사람의 ID
         self.tracking_id: Optional[str] = None
+        
+        # 이륙 후 초기 상승 대기 플래그
+        self.waiting_for_initial_ascent = False
 
         # ---------- 토픽/서비스 ----------
         qos_ctrl = _make_qos(depth=10, reliable=True)
@@ -158,7 +161,7 @@ class PersonFollower(Node):
         # 이동 중 플래그
         self.is_moving = False
         self.move_start_time: Optional[float] = None
-        self.move_timeout = 3.0  # 이동 타임아웃 (초)
+        self.move_timeout = 5.0  # 이동 타임아웃 (초)
 
         self.get_logger().info("=" * 50)
         self.get_logger().info("Person Follower Node 시작")
@@ -357,6 +360,16 @@ class PersonFollower(Node):
             dy = -self.move_step  # 왼쪽 이동
             direction = "왼쪽"
 
+        if(self.total_dy + dy > 10 or self.total_dy + dy < -10):
+            self.get_logger().warn("최대 이동 한도 도달")
+            if(self.total_dy + dy > 10):
+                dy = 10 - self.total_dy
+            else:
+                dy = -10 - self.total_dy
+            if abs(dy) < 0.01:
+                self.get_logger().info("더 이상 이동 불가")
+                return
+
         self.get_logger().info(f"이동: {direction} (dy={dy:.2f}m)")
         self._publish_moveby(dy=dy)
         self.total_dy += dy  # 이동량 누적
@@ -388,7 +401,11 @@ class PersonFollower(Node):
         msg.dx = float(dx)
         msg.dy = float(dy)
         msg.dz = float(dz)
-        msg.dyaw = float(dyaw)
+        # msg.dyaw = float(dyaw)
+        msg.dyaw = 0.0
+        self.get_logger().info(
+            f"MoveBy PUB → dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f}, dyaw={dyaw:.3f} rad"
+        )
         self.pub_moveby.publish(msg)
 
     # ---------- Gimbal 제어 ----------
@@ -484,6 +501,18 @@ class PersonFollower(Node):
     def _on_moveby_done(self, msg: Bool):
         self.is_moving = False
         self.move_start_time = None
+        
+        # 초기 상승 완료 후 추적 시작
+        if self.waiting_for_initial_ascent:
+            if msg.data:
+                self.get_logger().warning("상승 완료! 추적 시작 ✓")
+                self.tracking_enabled = True
+                self.waiting_for_initial_ascent = False
+            else:
+                self.get_logger().error("초기 상승 실패")
+                self.tracking_enabled = True
+                self.waiting_for_initial_ascent = False
+            return
 
         if self.returning_home:
             # 복귀 완료
@@ -549,24 +578,60 @@ class PersonFollower(Node):
 
         if ch == 't':
             self.get_logger().warning("=" * 30)
-            self.get_logger().warning("이륙 및 추적 시작!")
+            self.get_logger().warning("이륙 요청...")
             self.get_logger().warning("=" * 30)
             self._set_offboard(True)
-            self._call_trigger(self.cli_takeoff, 'takeoff')
-            self.is_flying = True
-            self.tracking_enabled = True
-            # 상태 초기화
-            self.total_dy = 0.0
-            self.last_target_seen_time = time.time()
-            self.returning_home = False
-            self.waiting_at_home = False
-            self.tracking_id = None  # 새로 정면 타겟 찾기
-            # 짐벌 초기화 (정면 0도)
-            self.current_gimbal_pitch = 0.0
-            self._publish_gimbal(pitch=0.0)
-            # 줌 초기화
-            self.is_zoomed_in = False
-            self._set_zoom(self.default_zoom)
+
+            # 이륙 성공 전까지 제어 비활성화
+            self.is_flying = False
+            self.tracking_enabled = False
+
+            # takeoff 서비스 확인
+            if not self.cli_takeoff.service_is_ready():
+                self.get_logger().info("takeoff 서비스 대기 중...")
+                if not self.cli_takeoff.wait_for_service(timeout_sec=5.0):
+                    self.get_logger().error("takeoff 서비스 없음")
+                    return
+
+            req = Trigger.Request()
+            fut = self.cli_takeoff.call_async(req)
+
+            def _takeoff_done(_):
+                try:
+                    resp = fut.result()
+                    if resp and resp.success:
+                        self.get_logger().warning("=" * 30)
+                        self.get_logger().warning("✅ 이륙 성공! +0.2m 상승 후 추적 시작")
+                        self.get_logger().warning("=" * 30)
+                        # 이륙 성공 후 is_flying만 활성화 (추적은 아직 비활성화)
+                        self.is_flying = True
+                        self.tracking_enabled = False  # moveby 완료 후 활성화
+                        self.total_dy = 0.0
+                        self.last_target_seen_time = time.time()
+                        self.returning_home = False
+                        self.waiting_at_home = False
+                        self.tracking_id = None
+                        self.current_gimbal_pitch = 0.0
+                        self._publish_gimbal(pitch=0.0)
+                        self.is_zoomed_in = False
+                        self._set_zoom(self.default_zoom)
+                        
+                        # +0.2m 상승 명령 발행 및 대기 플래그 설정
+                        
+                        time.sleep(5)
+                        self.get_logger().info("상승 명령 (dz=+0.2m) 발행")
+                        self.waiting_for_initial_ascent = True
+                        self._publish_moveby(dz=-0.2)
+                    else:
+                        self.get_logger().error(f"이륙 실패: {resp.message if resp else 'unknown error'}")
+                        self.is_flying = False
+                        self.tracking_enabled = False
+                except Exception as e:
+                    self.get_logger().error(f"이륙 오류: {e}")
+                    self.is_flying = False
+                    self.tracking_enabled = False
+
+            fut.add_done_callback(_takeoff_done)
 
         elif ch == 'l':
             self.get_logger().warning("착륙 요청")
@@ -586,6 +651,14 @@ class PersonFollower(Node):
             self.tracking_enabled = not self.tracking_enabled
             status = "재개" if self.tracking_enabled else "일시정지"
             self.get_logger().warning(f"추적 {status}")
+
+        elif ch == 'm':
+            self.get_logger().info("수동으로 아래로 이동")
+            self._publish_moveby(dz=-0.2)
+        
+        elif ch == 'n':
+            self.get_logger().info("수동으로 위로 이동")
+            self._publish_moveby(dz=0.2)
 
 
 def main():

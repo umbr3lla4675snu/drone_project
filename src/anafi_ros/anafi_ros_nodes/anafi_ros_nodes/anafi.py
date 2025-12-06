@@ -222,7 +222,7 @@ class Anafi(Node):
                                                         floating_point_range=[FloatingPointRange(from_value=0.1,
                                                                                                  to_value=4.0,
                                                                                                  step=0.0)]))
-        self.node.declare_parameter("drone/max_horizontal_speed", 1.0,  #
+        self.node.declare_parameter("drone/max_horizontal_speed", 4.0,  # 좌우 이동 속도 증가
                                     ParameterDescriptor(description="Max horizontal speed (in m/s) [0.1, 15.0]",
                                                         floating_point_range=[FloatingPointRange(from_value=0.1,
                                                                                                  to_value=15.0,
