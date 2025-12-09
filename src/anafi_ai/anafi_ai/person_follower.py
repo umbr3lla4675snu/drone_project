@@ -68,9 +68,9 @@ class PersonFollower(Node):
         self.declare_parameter('center_deadzone', 60)  # 중심 허용 오차 (픽셀)
         self.declare_parameter('move_step', 0.13)  # Y축 이동 기본 스텝 (m)
         self.declare_parameter('move_step_max', 1.0)  # Y축 이동 최대 스텝 (m)
-        self.declare_parameter('control_rate', 4.0)  # 제어 주기 (Hz) - 더 빠르게
-        self.declare_parameter('no_target_timeout', 5.0)  # 타겟 없을 때 복귀 대기 시간 (초)
-        self.declare_parameter('gimbal_pitch_gain', 0.03)  # 짐벌 피치 게인 (deg/pixel)
+        self.declare_parameter('control_rate', 4.0)  # 제어 주기 (Hz)
+        self.declare_parameter('no_target_timeout', 5.0)  # 복귀 대기 시간 (초)
+        self.declare_parameter('gimbal_pitch_gain', 0.02)  # 짐벌 피치 게인 (deg/pixel)
         self.declare_parameter('gimbal_deadzone', 20)  # 짐벌 제어 데드존 (픽셀)
         # self.declare_parameter('tracking_zoom', 1.2)  # 추적 중 줌 배율
         # self.declare_parameter('default_zoom', 1.0)  # 기본 줌 배율
