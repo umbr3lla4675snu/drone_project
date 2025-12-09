@@ -157,7 +157,7 @@ class Anafi(Node):
         self.node.create_service(Recording, 'camera/recording/start', self.start_recording_callback)
         self.node.create_service(Recording, 'camera/recording/stop', self.stop_recording_callback)
         self.node.create_service(SetBool, 'storage/download', self.download_media_callback)
-        self.node.create_service(Trigger, 'storage/delete', self.format_callback)
+        self.node.create_service(Trigger, 'storage/format', self.format_callback)
 
         # Messages
         self.msg_camera_info = CameraInfo()
@@ -222,7 +222,7 @@ class Anafi(Node):
                                                         floating_point_range=[FloatingPointRange(from_value=0.1,
                                                                                                  to_value=4.0,
                                                                                                  step=0.0)]))
-        self.node.declare_parameter("drone/max_horizontal_speed", 10.0,  # 좌우 이동 속도 증가
+        self.node.declare_parameter("drone/max_horizontal_speed", 0.8,  #
                                     ParameterDescriptor(description="Max horizontal speed (in m/s) [0.1, 15.0]",
                                                         floating_point_range=[FloatingPointRange(from_value=0.1,
                                                                                                  to_value=15.0,
@@ -445,14 +445,14 @@ class Anafi(Node):
             flush_raw_cb=self.flush_cb)
         # self.drone.streaming.start(media_name="DefaultVideo")
 
-        # self.drone(camera.set_streaming_mode(cam_id=0, value="low_latency")).wait()
-        self.drone(camera.set_streaming_mode(cam_id=0, value="high_reliability")).wait()
+        self.drone(camera.set_streaming_mode(cam_id=0, value="low_latency")).wait()
+        # self.drone(camera.set_streaming_mode(cam_id=0, value="high_reliability")).wait()
 
         media_name = "Front camera" if self.model == 'ai' else "DefaultVideo"
         self.drone.streaming.start(media_name=media_name)
         # self._streaming_start(media_name)
 
-        self.timer_streaming_watchdog = self.node.create_timer(2.0, self._streaming_watchdog)
+        self.timer_streaming_watchdog = self.node.create_timer(1.0, self._streaming_watchdog)
         
         self.processing_thread.start()
 
@@ -466,11 +466,11 @@ class Anafi(Node):
         self.drone.streaming.start(media_name=media_name)
 
     def _streaming_watchdog(self):
-        """최근 프레임이 3초 이상 없으면 pdraw를 재시작"""
+        """최근 프레임이 1초 이상 없으면 pdraw를 재시작"""
         now = time.time()
         last = getattr(self, "_last_frame_time", 0.0)
-        if now - last > 2.0:  # 1초 → 2초로 증가
-            self.node.get_logger().warn("No frames for >2s: restarting pdraw streaming")
+        if now - last > 1.0:
+            self.node.get_logger().warn("No frames for >1s: restarting pdraw streaming")
             media_name = "Front camera" if self.model == 'ai' else "DefaultVideo"
             try:
                 self._streaming_start(media_name)
@@ -767,7 +767,7 @@ class Anafi(Node):
         while not self.frame_queue.empty():
             self.frame_queue.get_nowait().unref()
         return True
-
+    
     def yuv_frame_processing(self):
         cv_bridge = CvBridge()  # 루프 밖에서 1회 생성 (성능)
         self._last_frame_time = time.time()  # 워치독 기준 시각
@@ -791,19 +791,21 @@ class Anafi(Node):
 
             # 1) 항상 이미지 퍼블리시 (vmeta 없어도)
             try:
-                # YUV 데이터에서 Y 채널(밝기)만 추출하여 그레이스케일로 publish
-                # cv2 변환 없이 직접 raw 데이터 사용
-                yuv_data = yuv_frame.as_ndarray()
-                
-                # I420 포맷: 전체 높이의 2/3가 Y 채널 (나머지는 U, V)
-                # yuv_data shape: (height * 1.5, width) for I420
-                total_height, width = yuv_data.shape
-                height = int(total_height * 2 / 3)  # Y 채널 높이
-                
-                # Y 채널만 추출 (처음 height 행)
-                y_plane = yuv_data[:height, :].copy()
-                
-                msg_image = cv_bridge.cv2_to_imgmsg(y_plane, encoding="mono8")
+                cv2_cvt_color_flag = {
+                    olympe.VDEF_I420: cv2.COLOR_YUV2BGR_I420,
+                    olympe.VDEF_NV12: cv2.COLOR_YUV2BGR_NV12,
+                }[yuv_frame.format()]
+
+                cv2frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv2_cvt_color_flag)
+
+                # 열화상 모드 컬러맵 (필요 모델에서만)
+                if self.model in {'thermal', 'usa'} and (getattr(self, 'thermal_rendering', 0) == 1):
+                    cv2frame = cv2.applyColorMap(cv2frame, cv2.COLORMAP_PLASMA)
+
+                # 720p로 리사이즈 (1280x720)
+                cv2frame = cv2.resize(cv2frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
+
+                msg_image = cv_bridge.cv2_to_imgmsg(cv2frame, encoding="bgr8")
 
                 # 타임스탬프: NTP가 있으면 사용, 없으면 now()
                 ts = None
@@ -823,173 +825,227 @@ class Anafi(Node):
             except Exception as e:
                 self.node.get_logger().warn(f"image publish error: {e}")
 
-            # 2) vmeta가 있을 때만 부가 토픽 퍼블리시
-            try:
-                if isinstance(vmeta, (list, tuple)) and len(vmeta) > 1 and vmeta[1]:
-                    # 시간 동기
-                    timestamp = info['raw']['frame']['timestamp']
-                    timescale = info['raw']['frame']['timescale']
-                    msg_time = Time()
-                    msg_time.sec = int(timestamp // timescale)
-                    msg_time.nanosec = int((timestamp % timescale) * (1e9 / timescale))
-                    self.pub_time.publish(msg_time)
+    # def yuv_frame_processing(self):
+    #     cv_bridge = CvBridge()  # 루프 밖에서 1회 생성 (성능)
+    #     self._last_frame_time = time.time()  # 워치독 기준 시각
 
-                    header = Header()
-                    header.stamp = self.node.get_clock().now().to_msg()
+    #     while rclpy.ok():
+    #         try:
+    #             yuv_frame = self.frame_queue.get(timeout=0.1)
+    #         except queue.Empty:
+    #             continue
 
-                    # 드론 자세 쿼터니언 → publish
-                    drone_quat = vmeta[1]['drone']['quat']
-                    msg_attitude = QuaternionStamped()
-                    msg_attitude.header = header
-                    msg_attitude.header.frame_id = '/world'
-                    msg_attitude.quaternion.x = drone_quat['x']
-                    msg_attitude.quaternion.y = -drone_quat['y']
-                    msg_attitude.quaternion.z = -drone_quat['z']
-                    msg_attitude.quaternion.w = drone_quat['w']
-                    self.pub_attitude.publish(msg_attitude)
+    #         # 프레임 수신 표시 (워치독용)
+    #         self._last_frame_time = time.time()
 
-                    # RPY
-                    (roll, pitch, yaw) = euler_from_quaternion(msg_attitude.quaternion)
-                    msg_rpy = Vector3Stamped()
-                    msg_rpy.header = header
-                    msg_rpy.header.frame_id = '/world'
-                    msg_rpy.vector.x = math.degrees(roll)
-                    msg_rpy.vector.y = math.degrees(pitch)
-                    msg_rpy.vector.z = math.degrees(yaw)
-                    self.pub_rpy.publish(msg_rpy)
+    #         try:
+    #             info = yuv_frame.info()     # 해상도/타임스탬프 등
+    #             vmeta = yuv_frame.vmeta()   # 드론 자세/속도/배터리 등
+    #         except Exception as e:
+    #             self.node.get_logger().warn(f"yuv_frame info/vmeta error: {e}")
+    #             yuv_frame.unref()
+    #             continue
 
-                    # 고도/위치
-                    msg_ground_distance = Float32()
-                    msg_ground_distance.data = vmeta[1]['drone']['ground_distance']
-                    self.pub_altitude.publish(msg_ground_distance)
+    #         # 1) 항상 이미지 퍼블리시 (vmeta 없어도)
+    #         try:
+    #             cv2_cvt_color_flag = {
+    #                 olympe.VDEF_I420: cv2.COLOR_YUV2BGR_I420,
+    #                 olympe.VDEF_NV12: cv2.COLOR_YUV2BGR_NV12,
+    #             }[yuv_frame.format()]
 
-                    if 'position' in vmeta[1]['drone']:
-                        position = vmeta[1]['drone']['position']
-                        msg_position = PointStamped()
-                        msg_position.header = header
-                        msg_position.header.frame_id = '/world'
-                        msg_position.point.x = position['north']
-                        msg_position.point.y = -position['east']
-                        msg_position.point.z = -position['down']
-                        self.pub_position.publish(msg_position)
+    #             cv2frame = cv2.cvtColor(yuv_frame.as_ndarray(), cv2_cvt_color_flag)
 
-                    if 'local_position' in vmeta[1]['drone']:
-                        local_position = vmeta[1]['drone']['local_position']
-                        msg_local_position = PointStamped()
-                        msg_local_position.header = header
-                        msg_local_position.header.frame_id = '/body'
-                        msg_local_position.point.x = local_position['x']
-                        msg_local_position.point.y = local_position['y']
-                        msg_local_position.point.z = local_position['z']
-                        self.pub_local_position.publish(msg_local_position)
+    #             # 열화상 모드 컬러맵 (필요 모델에서만)
+    #             if self.model in {'thermal', 'usa'} and (getattr(self, 'thermal_rendering', 0) == 1):
+    #                 cv2frame = cv2.applyColorMap(cv2frame, cv2.COLORMAP_PLASMA)
 
-                    # 속도(바디 프레임)
-                    speed = vmeta[1]['drone']['speed']
-                    v = [speed['north'], -speed['east'], -speed['down']]
-                    q = quaternion_inverse([drone_quat['w'], drone_quat['x'], -drone_quat['y'], -drone_quat['z']])
-                    v = rotate_vector(q, v)
-                    msg_speed = Vector3Stamped()
-                    msg_speed.header = header
-                    msg_speed.header.frame_id = '/body'
-                    msg_speed.vector.x = v[0]
-                    msg_speed.vector.y = v[1]
-                    msg_speed.vector.z = v[2]
-                    self.pub_speed.publish(msg_speed)
+    #             msg_image = cv_bridge.cv2_to_imgmsg(cv2frame, encoding="bgr8")
 
-                    # 배터리
-                    battery_percentage = vmeta[1]['drone']['battery_percentage']
-                    msg_battery_percentage = UInt8()
-                    msg_battery_percentage.data = battery_percentage
-                    self.pub_battery_percentage.publish(msg_battery_percentage)
-                    if battery_percentage % 10 == 0:
-                        self.node.get_logger().info(f"Battery level: {battery_percentage}%", throttle_duration_sec=100)
+    #             # 타임스탬프: NTP가 있으면 사용, 없으면 now()
+    #             ts = None
+    #             try:
+    #                 ts = info.get('ntp_raw_unskewed_timestamp', None)
+    #             except Exception:
+    #                 ts = None
+    #             if ts is not None:
+    #                 msg_image.header.stamp.sec = int(ts // 1e6)
+    #                 msg_image.header.stamp.nanosec = int((ts % 1e6) * 1e3)
+    #             else:
+    #                 msg_image.header.stamp = self.node.get_clock().now().to_msg()
 
-                    # 짐벌 자세
-                    gimbal_quat = vmeta[1]['camera']['quat']
-                    msg_g_att = QuaternionStamped()
-                    msg_g_att.header = header
-                    msg_g_att.header.frame_id = '/world'
-                    msg_g_att.quaternion.x = gimbal_quat['x']
-                    msg_g_att.quaternion.y = -gimbal_quat['y']
-                    msg_g_att.quaternion.z = -gimbal_quat['z']
-                    msg_g_att.quaternion.w = gimbal_quat['w']
-                    self.pub_gimbal_attitude.publish(msg_g_att)
+    #             msg_image.header.frame_id = '/camera'
+    #             self.pub_image.publish(msg_image)
 
-                    (g_roll, g_pitch, g_yaw) = euler_from_quaternion(msg_g_att.quaternion)
-                    msg_g_rpy = Vector3Stamped()
-                    msg_g_rpy.header = header
-                    msg_g_rpy.header.frame_id = '/world'
-                    msg_g_rpy.vector.x = math.degrees(g_roll)
-                    msg_g_rpy.vector.y = math.degrees(g_pitch)
-                    msg_g_rpy.vector.z = math.degrees(g_yaw)
-                    self.pub_gimbal_rpy.publish(msg_g_rpy)
+    #         except Exception as e:
+    #             self.node.get_logger().warn(f"image publish error: {e}")
 
-                    # 카메라 메타
-                    msg_exposure_time = Float32()
-                    msg_exposure_time.data = vmeta[1]['camera']['exposure_time']
-                    self.pub_exposure_time.publish(msg_exposure_time)
+    #         # 2) vmeta가 있을 때만 부가 토픽 퍼블리시
+    #         try:
+    #             if isinstance(vmeta, (list, tuple)) and len(vmeta) > 1 and vmeta[1]:
+    #                 # 시간 동기
+    #                 timestamp = info['raw']['frame']['timestamp']
+    #                 timescale = info['raw']['frame']['timescale']
+    #                 msg_time = Time()
+    #                 msg_time.sec = int(timestamp // timescale)
+    #                 msg_time.nanosec = int((timestamp % timescale) * (1e9 / timescale))
+    #                 self.pub_time.publish(msg_time)
 
-                    msg_iso_gain = UInt16()
-                    msg_iso_gain.data = vmeta[1]['camera']['iso_gain']
-                    self.pub_iso_gain.publish(msg_iso_gain)
+    #                 header = Header()
+    #                 header.stamp = self.node.get_clock().now().to_msg()
 
-                    msg_awb_r_gain = Float32()
-                    msg_awb_r_gain.data = vmeta[1]['camera']['awb_r_gain']
-                    self.pub_awb_r_gain.publish(msg_awb_r_gain)
+    #                 # 드론 자세 쿼터니언 → publish
+    #                 drone_quat = vmeta[1]['drone']['quat']
+    #                 msg_attitude = QuaternionStamped()
+    #                 msg_attitude.header = header
+    #                 msg_attitude.header.frame_id = '/world'
+    #                 msg_attitude.quaternion.x = drone_quat['x']
+    #                 msg_attitude.quaternion.y = -drone_quat['y']
+    #                 msg_attitude.quaternion.z = -drone_quat['z']
+    #                 msg_attitude.quaternion.w = drone_quat['w']
+    #                 self.pub_attitude.publish(msg_attitude)
 
-                    msg_awb_b_gain = Float32()
-                    msg_awb_b_gain.data = vmeta[1]['camera']['awb_b_gain']
-                    self.pub_awb_b_gain.publish(msg_awb_b_gain)
+    #                 # RPY
+    #                 (roll, pitch, yaw) = euler_from_quaternion(msg_attitude.quaternion)
+    #                 msg_rpy = Vector3Stamped()
+    #                 msg_rpy.header = header
+    #                 msg_rpy.header.frame_id = '/world'
+    #                 msg_rpy.vector.x = math.degrees(roll)
+    #                 msg_rpy.vector.y = math.degrees(pitch)
+    #                 msg_rpy.vector.z = math.degrees(yaw)
+    #                 self.pub_rpy.publish(msg_rpy)
 
-                    msg_hfov = Float32()
-                    msg_hfov.data = vmeta[1]['camera']['hfov']
-                    self.pub_hfov.publish(msg_hfov)
+    #                 # 고도/위치
+    #                 msg_ground_distance = Float32()
+    #                 msg_ground_distance.data = vmeta[1]['drone']['ground_distance']
+    #                 self.pub_altitude.publish(msg_ground_distance)
 
-                    msg_vfov = Float32()
-                    msg_vfov.data = vmeta[1]['camera']['vfov']
-                    self.pub_vfov.publish(msg_vfov)
+    #                 if 'position' in vmeta[1]['drone']:
+    #                     position = vmeta[1]['drone']['position']
+    #                     msg_position = PointStamped()
+    #                     msg_position.header = header
+    #                     msg_position.header.frame_id = '/world'
+    #                     msg_position.point.x = position['north']
+    #                     msg_position.point.y = -position['east']
+    #                     msg_position.point.z = -position['down']
+    #                     self.pub_position.publish(msg_position)
 
-                    # 상태 문자열
-                    self.state = vmeta[1]['drone']['flying_state']
-                    if self.state.startswith("FS_"):
-                        self.state = self.state[3:]
-                    msg_state = String()
-                    msg_state.data = self.state
-                    self.pub_state.publish(msg_state)
+    #                 if 'local_position' in vmeta[1]['drone']:
+    #                     local_position = vmeta[1]['drone']['local_position']
+    #                     msg_local_position = PointStamped()
+    #                     msg_local_position.header = header
+    #                     msg_local_position.header.frame_id = '/body'
+    #                     msg_local_position.point.x = local_position['x']
+    #                     msg_local_position.point.y = local_position['y']
+    #                     msg_local_position.point.z = local_position['z']
+    #                     self.pub_local_position.publish(msg_local_position)
 
-                    # 링크 품질(모델별)
-                    if self.model in {'4k', 'thermal', 'usa'}:
-                        msg_goodput = UInt16()
-                        msg_goodput.data = vmeta[1]['links'][0]['wifi']['goodput']
-                        self.pub_link_goodput.publish(msg_goodput)
+    #                 # 속도(바디 프레임)
+    #                 speed = vmeta[1]['drone']['speed']
+    #                 v = [speed['north'], -speed['east'], -speed['down']]
+    #                 q = quaternion_inverse([drone_quat['w'], drone_quat['x'], -drone_quat['y'], -drone_quat['z']])
+    #                 v = rotate_vector(q, v)
+    #                 msg_speed = Vector3Stamped()
+    #                 msg_speed.header = header
+    #                 msg_speed.header.frame_id = '/body'
+    #                 msg_speed.vector.x = v[0]
+    #                 msg_speed.vector.y = v[1]
+    #                 msg_speed.vector.z = v[2]
+    #                 self.pub_speed.publish(msg_speed)
 
-                        msg_quality = UInt8()
-                        msg_quality.data = vmeta[1]['links'][0]['wifi']['quality']
-                        self.pub_link_quality.publish(msg_quality)
+    #                 # 배터리
+    #                 battery_percentage = vmeta[1]['drone']['battery_percentage']
+    #                 msg_battery_percentage = UInt8()
+    #                 msg_battery_percentage.data = battery_percentage
+    #                 self.pub_battery_percentage.publish(msg_battery_percentage)
+    #                 if battery_percentage % 10 == 0:
+    #                     self.node.get_logger().info(f"Battery level: {battery_percentage}%", throttle_duration_sec=100)
 
-                        rssi = vmeta[1]['links'][0]['wifi']['rssi']
-                        msg_rssi = Int8()
-                        msg_rssi.data = rssi
-                        self.pub_wifi_rssi.publish(msg_rssi)
+    #                 # 짐벌 자세
+    #                 gimbal_quat = vmeta[1]['camera']['quat']
+    #                 msg_g_att = QuaternionStamped()
+    #                 msg_g_att.header = header
+    #                 msg_g_att.header.frame_id = '/world'
+    #                 msg_g_att.quaternion.x = gimbal_quat['x']
+    #                 msg_g_att.quaternion.y = -gimbal_quat['y']
+    #                 msg_g_att.quaternion.z = -gimbal_quat['z']
+    #                 msg_g_att.quaternion.w = gimbal_quat['w']
+    #                 self.pub_gimbal_attitude.publish(msg_g_att)
 
-                    if self.model == 'ai' and vmeta[1]['links'] != []:
-                        if 'starfish' in vmeta[1]['links'][0]:
-                            msg_quality = UInt8()
-                            msg_quality.data = vmeta[1]['links'][0]['starfish']['quality']
-                            self.pub_link_quality.publish(msg_quality)
+    #                 (g_roll, g_pitch, g_yaw) = euler_from_quaternion(msg_g_att.quaternion)
+    #                 msg_g_rpy = Vector3Stamped()
+    #                 msg_g_rpy.header = header
+    #                 msg_g_rpy.header.frame_id = '/world'
+    #                 msg_g_rpy.vector.x = math.degrees(g_roll)
+    #                 msg_g_rpy.vector.y = math.degrees(g_pitch)
+    #                 msg_g_rpy.vector.z = math.degrees(g_yaw)
+    #                 self.pub_gimbal_rpy.publish(msg_g_rpy)
 
-                    # CameraInfo 는 메타가 있을 때만 동기하여 퍼블리시
-                    self.msg_camera_info.header.stamp = msg_image.header.stamp if 'msg_image' in locals() else self.node.get_clock().now().to_msg()
-                    self.msg_camera_info.header.frame_id = '/camera'
-                    self.pub_camera_info.publish(self.msg_camera_info)
+    #                 # 카메라 메타
+    #                 msg_exposure_time = Float32()
+    #                 msg_exposure_time.data = vmeta[1]['camera']['exposure_time']
+    #                 self.pub_exposure_time.publish(msg_exposure_time)
 
-                else:
-                    self.node.get_logger().warn("Frame metadata empty (publishing image only)")
-            except Exception as e:
-                self.node.get_logger().warn(f"vmeta parse/publish error: {e}")
+    #                 msg_iso_gain = UInt16()
+    #                 msg_iso_gain.data = vmeta[1]['camera']['iso_gain']
+    #                 self.pub_iso_gain.publish(msg_iso_gain)
 
-            # 참조 해제
-            yuv_frame.unref()
+    #                 msg_awb_r_gain = Float32()
+    #                 msg_awb_r_gain.data = vmeta[1]['camera']['awb_r_gain']
+    #                 self.pub_awb_r_gain.publish(msg_awb_r_gain)
+
+    #                 msg_awb_b_gain = Float32()
+    #                 msg_awb_b_gain.data = vmeta[1]['camera']['awb_b_gain']
+    #                 self.pub_awb_b_gain.publish(msg_awb_b_gain)
+
+    #                 msg_hfov = Float32()
+    #                 msg_hfov.data = vmeta[1]['camera']['hfov']
+    #                 self.pub_hfov.publish(msg_hfov)
+
+    #                 msg_vfov = Float32()
+    #                 msg_vfov.data = vmeta[1]['camera']['vfov']
+    #                 self.pub_vfov.publish(msg_vfov)
+
+    #                 # 상태 문자열
+    #                 self.state = vmeta[1]['drone']['flying_state']
+    #                 if self.state.startswith("FS_"):
+    #                     self.state = self.state[3:]
+    #                 msg_state = String()
+    #                 msg_state.data = self.state
+    #                 self.pub_state.publish(msg_state)
+
+    #                 # 링크 품질(모델별)
+    #                 if self.model in {'4k', 'thermal', 'usa'}:
+    #                     msg_goodput = UInt16()
+    #                     msg_goodput.data = vmeta[1]['links'][0]['wifi']['goodput']
+    #                     self.pub_link_goodput.publish(msg_goodput)
+
+    #                     msg_quality = UInt8()
+    #                     msg_quality.data = vmeta[1]['links'][0]['wifi']['quality']
+    #                     self.pub_link_quality.publish(msg_quality)
+
+    #                     rssi = vmeta[1]['links'][0]['wifi']['rssi']
+    #                     msg_rssi = Int8()
+    #                     msg_rssi.data = rssi
+    #                     self.pub_wifi_rssi.publish(msg_rssi)
+
+    #                 if self.model == 'ai' and vmeta[1]['links'] != []:
+    #                     if 'starfish' in vmeta[1]['links'][0]:
+    #                         msg_quality = UInt8()
+    #                         msg_quality.data = vmeta[1]['links'][0]['starfish']['quality']
+    #                         self.pub_link_quality.publish(msg_quality)
+
+    #                 # CameraInfo 는 메타가 있을 때만 동기하여 퍼블리시
+    #                 self.msg_camera_info.header.stamp = msg_image.header.stamp if 'msg_image' in locals() else self.node.get_clock().now().to_msg()
+    #                 self.msg_camera_info.header.frame_id = '/camera'
+    #                 self.pub_camera_info.publish(self.msg_camera_info)
+
+    #             else:
+    #                 self.node.get_logger().warn("Frame metadata empty (publishing image only)")
+    #         except Exception as e:
+    #             self.node.get_logger().warn(f"vmeta parse/publish error: {e}")
+
+    #         # 참조 해제
+    #         yuv_frame.unref()
 
     # def takeoff_callback(self, request, response):
     # 	self.node.get_logger().warning("Taking off")
@@ -1304,15 +1360,15 @@ class Anafi(Node):
                     media_info = olympe.Media.media_info(self.drone.media, media_id = media)
                     self.node.get_logger().info("Media %i/%i: downloading %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
                     media_download = self.drone(download_media(media))
-                    
-                    # if media_download.wait(_timeout=100).success():
-                    #     self.node.get_logger().info("Media %i/%i: downloaded %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
-                    # else:
-                    #     self.node.get_logger().error("Failed to download media %s" % str(media))
+                    resources = media_download.as_completed(timeout=100)
+                    self.node.get_logger().info("Media %i/%i: downloaded %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
+
+                    for resource in resources:
+                        if not resource.success():
+                            self.node.get_logger().error("Failed to download %s" % str(resource.resource_id))
+                            continue
 
                     media_count += 1
-
-                self.drone(delete_all_media()).wait()
 
                 if request.data:  # cut media
                     self.drone(delete_all_media())
@@ -1328,20 +1384,17 @@ class Anafi(Node):
         return response
         
     def format_callback(self, request, response):
-        self.node.get_logger().info("delete all media")
-        self.drone(delete_all_media())
+        info = self.drone.get_state(olympe.messages.user_storage.info)  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.info
+        if info['name'] != "":
+            self.node.get_logger().info("Formatting media %s (%.1fGB)" % (info['name'], info['capacity']/(2**30)))
+            self.drone(olympe.messages.user_storage.format_with_type(  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.format_with_type
+                label="",
+                type=olympe.enums.user_storage.formatting_type(0))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.enums.user_storage.formatting_type
+                >>
+                olympe.messages.user_storage.start_monitoring(period=1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.start_monitoring
+        else:
+            self.node.get_logger().warning("There is no media to format")
         return response
-        # info = self.drone.get_state(olympe.messages.user_storage.info)  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.info
-        # if info['name'] != "":
-        #     self.node.get_logger().info("Formatting media %s (%.1fGB)" % (info['name'], info['capacity']/(2**30)))
-        #     self.drone(olympe.messages.user_storage.format_with_type(  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.format_with_type
-        #         label="",
-        #         type=olympe.enums.user_storage.formatting_type(1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.enums.user_storage.formatting_type
-        #         >>
-        #         olympe.messages.user_storage.start_monitoring(period=1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.start_monitoring
-        # else:
-        #     self.node.get_logger().warning("There is no media to format")
-        # return response
 
     def discover_drones_callback(self, request, response):
         self.node.get_logger().info("Discovering drones...")

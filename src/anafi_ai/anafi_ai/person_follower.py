@@ -63,12 +63,12 @@ class PersonFollower(Node):
         super().__init__('person_follower', namespace='/anafi')
 
         # ---------- 파라미터 ----------
-        self.declare_parameter('image_width', 1920)  # 카메라 이미지 가로 해상도
-        self.declare_parameter('image_height', 1080)  # 카메라 이미지 세로 해상도
+        self.declare_parameter('image_width', 1280)  # 카메라 이미지 가로 해상도
+        self.declare_parameter('image_height', 720)  # 카메라 이미지 세로 해상도
         self.declare_parameter('center_deadzone', 60)  # 중심 허용 오차 (픽셀)
-        self.declare_parameter('move_step', 0.13)  # Y축 이동 기본 스텝 (m)
+        self.declare_parameter('move_step', 0.05)  # Y축 이동 기본 스텝 (m)
         self.declare_parameter('move_step_max', 1.0)  # Y축 이동 최대 스텝 (m)
-        self.declare_parameter('control_rate', 4.0)  # 제어 주기 (Hz)
+        self.declare_parameter('control_rate', 1.0)  # 제어 주기 (Hz)
         self.declare_parameter('no_target_timeout', 5.0)  # 복귀 대기 시간 (초)
         self.declare_parameter('gimbal_pitch_gain', 0.02)  # 짐벌 피치 게인 (deg/pixel)
         self.declare_parameter('gimbal_deadzone', 20)  # 짐벌 제어 데드존 (픽셀)
@@ -370,12 +370,12 @@ class PersonFollower(Node):
             dy = -dy_mag
             direction = "왼쪽"
 
-        if(self.total_dy + dy > 5 or self.total_dy + dy < -5):
+        if(self.total_dy + dy > 1 or self.total_dy + dy < -1):
             self.get_logger().warn("최대 이동 한도 도달")
-            if(self.total_dy + dy > 5):
-                dy = 5 - self.total_dy
+            if(self.total_dy + dy > 1):
+                dy = 1 - self.total_dy
             else:
-                dy = -5 - self.total_dy
+                dy = -1 - self.total_dy
             if abs(dy) < 0.01:
                 self.get_logger().info("더 이상 이동 불가")
                 return
@@ -401,7 +401,7 @@ class PersonFollower(Node):
         self.get_logger().warning(f"시작 위치로 Y축 복귀 (dy={return_dy:.2f}m, 공중 유지)")
 
         self.returning_home = True
-        self._publish_moveby(dy=return_dy)
+        self._publish_moveby(dy=return_dy / 2)
         self.is_moving = True
         self.move_start_time = time.time()
 
@@ -444,7 +444,7 @@ class PersonFollower(Node):
             return
         
         # 이미지 중심과의 Y 오차 (위로 가면 음수, 아래로 가면 양수)
-        error_y = face_y - self.image_center_y + 100
+        error_y = face_y - self.image_center_y + 50
         
         self.get_logger().info(f"얼굴Y={face_y:.0f}, 중심Y={self.image_center_y:.0f}, 오차={error_y:.0f}px")
         
@@ -629,9 +629,9 @@ class PersonFollower(Node):
                         # +0.6m 상승 명령 발행 및 대기 플래그 설정
                         
                         time.sleep(5)
-                        self.get_logger().info("상승 명령 (dz=-0.6m) 발행")
+                        self.get_logger().info("상승 명령 (dz=-1.0m) 발행")
                         self.waiting_for_initial_ascent = True
-                        self._publish_moveby(dz=-0.6)
+                        self._publish_moveby(dz=-1.0)
                     else:
                         self.get_logger().error(f"이륙 실패: {resp.message if resp else 'unknown error'}")
                         self.is_flying = False

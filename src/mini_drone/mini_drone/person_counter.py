@@ -96,7 +96,7 @@ class PersonCounter(Node):
         self.stable_count = 0  # 내부 확정 카운트
         self._pending_count = 0
         self._pending_since = None
-        self.bounce_delta = 0.3  # stable 감소 시 상하 진동 크기 (m)
+        self.bounce_delta = 0.1  # stable 감소 시 상하 진동 크기 (m)
         self._bounce_timer = None
         self._bounce_active = False
         self._is_takeoff = False
