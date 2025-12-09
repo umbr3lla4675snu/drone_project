@@ -2,9 +2,6 @@
 """
 Person Follower Node for Parrot Anafi
 
-키보드 't' 누르면 이륙 후, 카메라에 보이는 사람 중 정면을 보고 있는 사람을
-좌우(Y축) 이동만으로 따라다니는 노드
-
 키 매핑:
   t : 이륙 및 추적 시작
   l : 착륙
@@ -68,15 +65,15 @@ class PersonFollower(Node):
         # ---------- 파라미터 ----------
         self.declare_parameter('image_width', 1920)  # 카메라 이미지 가로 해상도
         self.declare_parameter('image_height', 1080)  # 카메라 이미지 세로 해상도
-        self.declare_parameter('center_deadzone', 120)  # 중심 허용 오차 (픽셀) - 더 민감하게
-        self.declare_parameter('move_step', 0.12)  # Y축 이동 기본 스텝 (m)
+        self.declare_parameter('center_deadzone', 60)  # 중심 허용 오차 (픽셀)
+        self.declare_parameter('move_step', 0.13)  # Y축 이동 기본 스텝 (m)
         self.declare_parameter('move_step_max', 1.0)  # Y축 이동 최대 스텝 (m)
         self.declare_parameter('control_rate', 4.0)  # 제어 주기 (Hz) - 더 빠르게
         self.declare_parameter('no_target_timeout', 5.0)  # 타겟 없을 때 복귀 대기 시간 (초)
         self.declare_parameter('gimbal_pitch_gain', 0.03)  # 짐벌 피치 게인 (deg/pixel)
-        self.declare_parameter('gimbal_deadzone', 60)  # 짐벌 제어 데드존 (픽셀)
-        self.declare_parameter('tracking_zoom', 1.2)  # 추적 중 줌 배율
-        self.declare_parameter('default_zoom', 1.0)  # 기본 줌 배율
+        self.declare_parameter('gimbal_deadzone', 20)  # 짐벌 제어 데드존 (픽셀)
+        # self.declare_parameter('tracking_zoom', 1.2)  # 추적 중 줌 배율
+        # self.declare_parameter('default_zoom', 1.0)  # 기본 줌 배율
 
         self.image_width = self.get_parameter('image_width').value
         self.image_height = self.get_parameter('image_height').value
@@ -87,8 +84,8 @@ class PersonFollower(Node):
         self.no_target_timeout = self.get_parameter('no_target_timeout').value
         self.gimbal_pitch_gain = self.get_parameter('gimbal_pitch_gain').value
         self.gimbal_deadzone = self.get_parameter('gimbal_deadzone').value
-        self.tracking_zoom = self.get_parameter('tracking_zoom').value
-        self.default_zoom = self.get_parameter('default_zoom').value
+        # self.tracking_zoom = self.get_parameter('tracking_zoom').value
+        # self.default_zoom = self.get_parameter('default_zoom').value
 
         # 이미지 중심 좌표
         self.image_center_x = self.image_width / 2.0
@@ -98,7 +95,7 @@ class PersonFollower(Node):
         self.current_gimbal_pitch = 0.0
         
         # 현재 줌 상태
-        self.current_zoom = self.default_zoom
+        # self.current_zoom = self.default_zoom
         self.is_zoomed_in = False
 
         # ---------- 상태 변수 ----------
@@ -180,8 +177,8 @@ class PersonFollower(Node):
         self.get_logger().info("  l : 착륙")
         self.get_logger().info("  k : 긴급 정지")
         self.get_logger().info("  스페이스 : 추적 일시정지/재개")
-        self.get_logger().info("  r : 녹화 시작/중단")
-        self.get_logger().info("  d : 녹화 파일 다운로드")
+        # self.get_logger().info("  r : 녹화 시작/중단")
+        # self.get_logger().info("  d : 녹화 파일 다운로드")
         self.get_logger().info(f"  정면 타겟 없으면 {self.no_target_timeout}초 후 이륙지점 복귀")
         self.get_logger().info("=" * 50)
 
@@ -207,7 +204,7 @@ class PersonFollower(Node):
             conf_map[kp.id] = kp.score
 
         # 얼굴 키포인트 (1=nose, 2=left_eye, 3=right_eye, 4=left_ear, 5=right_ear)
-        # 주의: yolo_node에서 id = kp_id + 1 로 저장하므로 1부터 시작
+        # yolo_node에서 id = 1부터 시작
         nose_conf = conf_map.get(1, 0.0)
         left_eye_conf = conf_map.get(2, 0.0)
         right_eye_conf = conf_map.get(3, 0.0)
@@ -228,14 +225,13 @@ class PersonFollower(Node):
 
     # ---------- 타겟 선택 ----------
     def _find_front_facing_person(self) -> Optional[Detection]:
-        """정면을 보고 있는 사람 중 가장 큰 사람(가까운 사람) 선택"""
+        """정면을 보고 있는 사람 중 가장 큰 사람 선택"""
         candidates = []
 
         for det in self.last_detections:
             if det.class_name != 'person':
                 continue
             if self._is_facing_front(det):
-                # bbox 크기로 거리 추정 (클수록 가까움)
                 size = det.bbox.size.x * det.bbox.size.y
                 candidates.append((det, size))
 
@@ -261,7 +257,6 @@ class PersonFollower(Node):
 
     # ---------- 제어 루프 ----------
     def _control_tick(self):
-        """주기적 제어 루프"""
         if not self.is_flying or not self.tracking_enabled:
             return
 
@@ -306,18 +301,17 @@ class PersonFollower(Node):
             if self.tracking_id is not None:
                 self.get_logger().info(f"추적 대상 (ID={self.tracking_id}) 화면에서 사라짐")
                 self.tracking_id = None
-                self._zoom_out_to_default()  # 추적 해제 시 줌 아웃
+                # self._zoom_out_to_default()
 
             target = self._find_front_facing_person()
             if target is not None:
                 self.tracking_id = target.id
                 self.get_logger().warning(f"새 타겟 감지! ID={target.id}")
-                self._zoom_in_for_tracking()  # 새 타겟 추적 시 줌 인
+                # self._zoom_in_for_tracking()
 
         # 타겟 없음 처리
         if target is None:
-            # 줌 아웃 (타겟 없으면)
-            self._zoom_out_to_default()
+            # self._zoom_out_to_default()
             
             if self.last_target_seen_time is None:
                 self.last_target_seen_time = current_time
@@ -338,7 +332,7 @@ class PersonFollower(Node):
             return
 
         # 타겟 발견 → 줌 인
-        self._zoom_in_for_tracking()
+        # self._zoom_in_for_tracking()
 
         # 타겟 발견 → 타이머 리셋
         self.last_target_seen_time = current_time
@@ -370,18 +364,18 @@ class PersonFollower(Node):
         dy_mag = min(self.move_step_max, self.move_step * scale)
 
         if error_x > 0:
-            dy = dy_mag  # 오른쪽 이동
+            dy = dy_mag
             direction = "오른쪽"
         else:
-            dy = -dy_mag  # 왼쪽 이동
+            dy = -dy_mag
             direction = "왼쪽"
 
-        if(self.total_dy + dy > 10 or self.total_dy + dy < -10):
+        if(self.total_dy + dy > 5 or self.total_dy + dy < -5):
             self.get_logger().warn("최대 이동 한도 도달")
-            if(self.total_dy + dy > 10):
-                dy = 10 - self.total_dy
+            if(self.total_dy + dy > 5):
+                dy = 5 - self.total_dy
             else:
-                dy = -10 - self.total_dy
+                dy = -5 - self.total_dy
             if abs(dy) < 0.01:
                 self.get_logger().info("더 이상 이동 불가")
                 return
@@ -389,6 +383,7 @@ class PersonFollower(Node):
         self.get_logger().info(f"이동: {direction} (dy={dy:.2f}m)")
         self._publish_moveby(dy=dy)
         self.total_dy += dy  # 이동량 누적
+        self.get_logger().info(f"누적 Y 이동량: {self.total_dy:.2f}m")
         self.is_moving = True
         self.move_start_time = time.time()
 
@@ -396,7 +391,6 @@ class PersonFollower(Node):
     def _return_to_home(self):
         """시작 위치로 복귀 (공중에서 Y축 이동만 되돌림)"""
         if abs(self.total_dy) < 0.1:
-            # 이미 시작 위치 근처
             self.get_logger().warning("이미 시작 위치 근처, 대기 모드 진입")
             self.waiting_at_home = True
             self.returning_home = False
@@ -407,7 +401,7 @@ class PersonFollower(Node):
         self.get_logger().warning(f"시작 위치로 Y축 복귀 (dy={return_dy:.2f}m, 공중 유지)")
 
         self.returning_home = True
-        self._publish_moveby(dy=return_dy)  # Y축만!
+        self._publish_moveby(dy=return_dy)
         self.is_moving = True
         self.move_start_time = time.time()
 
@@ -428,12 +422,10 @@ class PersonFollower(Node):
     def _get_face_center_y(self, detection: Detection) -> Optional[float]:
         """얼굴 중심 Y좌표 추출 (코 또는 눈 위치 사용)"""
         if not detection.keypoints or not detection.keypoints.data:
-            # 키포인트 없으면 bbox 상단 1/3 지점 사용
             return detection.bbox.center.position.y - detection.bbox.size.y * 0.2
         
         keypoints = detection.keypoints.data
         
-        # 코(id=1) 또는 눈(id=2,3) 위치 찾기
         face_y_points = []
         for kp in keypoints:
             if kp.id in [1, 2, 3] and kp.score > 0.5:  # nose, left_eye, right_eye
@@ -452,7 +444,7 @@ class PersonFollower(Node):
             return
         
         # 이미지 중심과의 Y 오차 (위로 가면 음수, 아래로 가면 양수)
-        error_y = face_y - self.image_center_y
+        error_y = face_y - self.image_center_y + 100
         
         self.get_logger().info(f"얼굴Y={face_y:.0f}, 중심Y={self.image_center_y:.0f}, 오차={error_y:.0f}px")
         
@@ -461,17 +453,13 @@ class PersonFollower(Node):
             self.get_logger().info(f"짐벌 데드존 내 (오차 {error_y:.0f} < {self.gimbal_deadzone})")
             return
         
-        # 목표 피치 각도 계산 (이미지에서 아래에 있으면 카메라를 아래로)
-        # 이미지 Y+ = 아래, 짐벌 pitch+ = 아래 (Anafi)
-        # error_y를 피치 각도로 직접 변환 (절대 각도)
         target_pitch = error_y * self.gimbal_pitch_gain
         
-        # 피치 범위 제한 (-90 ~ +30)
+        # 범위 제한 (-90 ~ +30)
         target_pitch = max(-90.0, min(30.0, target_pitch))
         
         self.get_logger().info(f"짐벌 피치: {target_pitch:.1f}° (오차 {error_y:.0f}px → 위쪽" if error_y < 0 else f"짐벌 피치: {target_pitch:.1f}° (오차 {error_y:.0f}px → 아래쪽)")
         
-        # 변화가 있으면 명령 전송
         if abs(target_pitch - self.current_gimbal_pitch) > 0.5:
             self.current_gimbal_pitch = target_pitch
             self._publish_gimbal(pitch=target_pitch)
@@ -481,35 +469,34 @@ class PersonFollower(Node):
         """짐벌 명령 퍼블리시 (상대 각도 - 드론 기준)"""
         msg = GimbalCommand()
         msg.mode = 0  # position mode
-        msg.frame = 1  # relative frame (드론 기준) - absolute(2)면 드론 yaw에 영향줄 수 있음
+        msg.frame = 1  # relative frame
         msg.roll = float(roll)
         msg.pitch = float(pitch)
-        msg.yaw = 0.0  # yaw는 항상 0으로 고정 (드론 회전 방지)
+        msg.yaw = 0.0  # yaw는 0으로 고정
         self.pub_gimbal.publish(msg)
 
     # ---------- 줌 제어 ----------
     def _set_zoom(self, zoom_level: float):
-        """카메라 줌 설정"""
-        if abs(self.current_zoom - zoom_level) < 0.05:
-            return  # 변화 없으면 무시
+        return
+        # """카메라 줌 설정"""
+        # if abs(self.current_zoom - zoom_level) < 0.05:
+        #     return  # 변화 없으면 무시
         
-        self.current_zoom = zoom_level
-        msg = CameraCommand()
-        msg.mode = 0  # level mode (절대값)
-        msg.zoom = float(zoom_level)
-        self.pub_camera.publish(msg)
-        self.get_logger().info(f"줌: {zoom_level:.1f}x")
+        # self.current_zoom = zoom_level
+        # msg = CameraCommand()
+        # msg.mode = 0  # level mode (절대값)
+        # msg.zoom = float(zoom_level)
+        # self.pub_camera.publish(msg)
+        # self.get_logger().info(f"줌: {zoom_level:.1f}x")
 
     def _zoom_in_for_tracking(self):
-        """추적 시작 시 줌 인 (임시 비활성화)"""
-        pass  # 줌 임시 비활성화
+        return
         # if not self.is_zoomed_in:
         #     self._set_zoom(self.tracking_zoom)
         #     self.is_zoomed_in = True
 
     def _zoom_out_to_default(self):
-        """추적 해제 시 줌 아웃 (임시 비활성화)"""
-        pass  # 줌 임시 비활성화
+        return
         # if self.is_zoomed_in:
         #     self._set_zoom(self.default_zoom)
         #     self.is_zoomed_in = False
@@ -535,7 +522,7 @@ class PersonFollower(Node):
         if self.returning_home:
             # 복귀 완료
             self.returning_home = False
-            self.total_dy = 0.0  # 이동량 리셋
+            self.total_dy = 0.0
             self.waiting_at_home = True
             self.get_logger().warning("시작 위치 복귀 완료! 정면 타깃 대기 중...")
             return
@@ -619,7 +606,7 @@ class PersonFollower(Node):
                     resp = fut.result()
                     if resp and resp.success:
                         self.get_logger().warning("=" * 30)
-                        self.get_logger().warning("✅ 이륙 성공! +0.2m 상승 후 추적 시작")
+                        self.get_logger().warning("✅ 이륙 성공! +0.6m 상승 후 추적 시작")
                         self.get_logger().warning("=" * 30)
                         # 이륙 성공 후 is_flying만 활성화 (추적은 아직 비활성화)
                         self.is_flying = True
@@ -632,19 +619,19 @@ class PersonFollower(Node):
                         self.current_gimbal_pitch = 0.0
                         self._publish_gimbal(pitch=0.0)
                         self.is_zoomed_in = False
-                        self._set_zoom(self.default_zoom)
+                        # self._set_zoom(self.default_zoom)
                         
                         # 이륙 후 녹화 시작
                         if not self.is_recording:
                             self.is_recording = True
                             self._start_recording()
                         
-                        # +0.2m 상승 명령 발행 및 대기 플래그 설정
+                        # +0.6m 상승 명령 발행 및 대기 플래그 설정
                         
                         time.sleep(5)
-                        self.get_logger().info("상승 명령 (dz=+0.2m) 발행")
+                        self.get_logger().info("상승 명령 (dz=-0.6m) 발행")
                         self.waiting_for_initial_ascent = True
-                        self._publish_moveby(dz=-0.4)
+                        self._publish_moveby(dz=-0.6)
                     else:
                         self.get_logger().error(f"이륙 실패: {resp.message if resp else 'unknown error'}")
                         self.is_flying = False
@@ -659,7 +646,7 @@ class PersonFollower(Node):
         elif ch == 'l':
             self.get_logger().warning("착륙 요청")
             self.tracking_enabled = False
-            self._zoom_out_to_default()  # 착륙 시 줌 아웃
+            # self._zoom_out_to_default()  # 착륙 시 줌 아웃
             
             # 착륙 전 녹화 중단
             if self.is_recording:
@@ -673,7 +660,7 @@ class PersonFollower(Node):
         elif ch == 'k':
             self.get_logger().error("긴급 정지!")
             self.tracking_enabled = False
-            self._zoom_out_to_default()  # 정지 시 줌 아웃
+            # self._zoom_out_to_default()  # 정지 시 줌 아웃
             self._call_trigger(self.cli_halt, 'halt')
             self.is_flying = False
 
@@ -683,11 +670,11 @@ class PersonFollower(Node):
             self.get_logger().warning(f"추적 {status}")
 
         elif ch == 'm':
-            self.get_logger().info("수동으로 아래로 이동")
+            self.get_logger().info("수동으로 위로 이동")
             self._publish_moveby(dz=-0.2)
         
         elif ch == 'n':
-            self.get_logger().info("수동으로 위로 이동")
+            self.get_logger().info("수동으로 아래로 이동")
             self._publish_moveby(dz=0.2)
 
         # elif ch == 'r':
@@ -714,7 +701,6 @@ class PersonFollower(Node):
         try:
             from anafi_ros_interfaces.srv import Recording
             req = Recording.Request()
-            # Recording.srv expects uint8 enums, not strings
             req.mode = 0         # standard
             req.resolution = 3   # 1920x1080 (Full HD)
             req.framerate = 2    # 30 fps
@@ -767,9 +753,9 @@ class PersonFollower(Node):
     def _download_media(self):
         """녹화된 미디어 파일 다운로드"""
         if not self.cli_download.service_is_ready():
-            self.get_logger().info("camera/download_media 서비스 대기 중...")
+            self.get_logger().info("다운로드 서비스 대기 중...")
             if not self.cli_download.wait_for_service(timeout_sec=3.0):
-                self.get_logger().error("camera/download_media 서비스 없음")
+                self.get_logger().error("다운로드 서비스 없음")
                 return
 
         try:
@@ -782,7 +768,8 @@ class PersonFollower(Node):
                         self.get_logger().warning(f"✅ 다운로드 완료: {resp.message}")
                         self.get_logger().warning("파일 위치: ~/Pictures/Anafi")
                     else:
-                        self.get_logger().error(f"다운로드 실패: {resp.message if resp else 'unknown error'}")
+                        pass
+                        # self.get_logger().error(f"다운로드 실패: {resp.message if resp else 'unknown error'}")
                 except Exception as e:
                     self.get_logger().error(f"다운로드 오류: {e}")
 

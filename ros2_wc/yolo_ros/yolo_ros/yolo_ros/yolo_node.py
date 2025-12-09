@@ -53,7 +53,7 @@ class YoloNode(LifecycleNode):
 
         # params
         self.declare_parameter("model_type", "YOLO")
-        self.declare_parameter("model", "yolov8m.pt")
+        self.declare_parameter("model", "yolo11n-pose.pt")
         self.declare_parameter("device", "cuda:0")
         self.declare_parameter("yolo_encoding", "bgr8")
         self.declare_parameter("enable", True)

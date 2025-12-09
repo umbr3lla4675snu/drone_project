@@ -157,7 +157,7 @@ class Anafi(Node):
         self.node.create_service(Recording, 'camera/recording/start', self.start_recording_callback)
         self.node.create_service(Recording, 'camera/recording/stop', self.stop_recording_callback)
         self.node.create_service(SetBool, 'storage/download', self.download_media_callback)
-        self.node.create_service(Trigger, 'storage/format', self.format_callback)
+        self.node.create_service(Trigger, 'storage/delete', self.format_callback)
 
         # Messages
         self.msg_camera_info = CameraInfo()
@@ -1305,11 +1305,10 @@ class Anafi(Node):
                     self.node.get_logger().info("Media %i/%i: downloading %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
                     media_download = self.drone(download_media(media))
                     
-                    # as_completed()의 결과를 리스트로 변환하여 무한루프 방지
-                    if media_download.wait(_timeout=100).success():
-                        self.node.get_logger().info("Media %i/%i: downloaded %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
-                    else:
-                        self.node.get_logger().error("Failed to download media %s" % str(media))
+                    # if media_download.wait(_timeout=100).success():
+                    #     self.node.get_logger().info("Media %i/%i: downloaded %.1fMB" % (media_count, num_media, media_info.size/(2**20)))
+                    # else:
+                    #     self.node.get_logger().error("Failed to download media %s" % str(media))
 
                     media_count += 1
 
@@ -1329,17 +1328,20 @@ class Anafi(Node):
         return response
         
     def format_callback(self, request, response):
-        info = self.drone.get_state(olympe.messages.user_storage.info)  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.info
-        if info['name'] != "":
-            self.node.get_logger().info("Formatting media %s (%.1fGB)" % (info['name'], info['capacity']/(2**30)))
-            self.drone(olympe.messages.user_storage.format_with_type(  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.format_with_type
-                label="",
-                type=olympe.enums.user_storage.formatting_type(1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.enums.user_storage.formatting_type
-                >>
-                olympe.messages.user_storage.start_monitoring(period=1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.start_monitoring
-        else:
-            self.node.get_logger().warning("There is no media to format")
+        self.node.get_logger().info("delete all media")
+        self.drone(delete_all_media())
         return response
+        # info = self.drone.get_state(olympe.messages.user_storage.info)  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.info
+        # if info['name'] != "":
+        #     self.node.get_logger().info("Formatting media %s (%.1fGB)" % (info['name'], info['capacity']/(2**30)))
+        #     self.drone(olympe.messages.user_storage.format_with_type(  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.format_with_type
+        #         label="",
+        #         type=olympe.enums.user_storage.formatting_type(1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.enums.user_storage.formatting_type
+        #         >>
+        #         olympe.messages.user_storage.start_monitoring(period=1))  # https://developer.parrot.com/docs/olympe/arsdkng_user_storage.html#olympe.messages.user_storage.start_monitoring
+        # else:
+        #     self.node.get_logger().warning("There is no media to format")
+        # return response
 
     def discover_drones_callback(self, request, response):
         self.node.get_logger().info("Discovering drones...")

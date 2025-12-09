@@ -64,11 +64,11 @@ class PersonCounter(Node):
 
         # ---------- 파라미터 ----------
         self.declare_parameter('image_topic', '/camera/image')
-        self.declare_parameter('model', 'yolo11n.pt')  # 가벼운 모델 사용
+        self.declare_parameter('model', 'yolo11m.pt')
         self.declare_parameter('device', 'cuda:0')
         self.declare_parameter('threshold', 0.5)
         self.declare_parameter('publish_rate', 1.0)  # Hz
-        self.declare_parameter('takeoff_height', 1.5)  # m
+        self.declare_parameter('takeoff_height', 1.2)  # m
         self.declare_parameter('stabilize_sec', 5.0)  # 감지 변화 확정 대기 시간
         self.declare_parameter('world_frame', 'map')
 
@@ -128,7 +128,7 @@ class PersonCounter(Node):
         # ---------- Service Clients ----------
         self.cli_stop = self.create_client(Trigger, '/cf/stop')
 
-        # ---------- 처리 타이머 ----------
+        # ---------- 타이머 ----------
         self.timer = self.create_timer(1.0 / self.publish_rate, self._process_tick)
 
         # ---------- 키보드 ----------
@@ -152,16 +152,13 @@ class PersonCounter(Node):
         self.get_logger().info("=" * 50)
 
     def _on_image(self, msg: Image):
-        """이미지 수신"""
         self.latest_image = msg
 
     def _process_tick(self):
-        """주기적으로 YOLO 처리 및 person 수 퍼블리시"""
         if self.latest_image is None:
             return
 
         try:
-            # 이미지 변환
             cv_image = self.cv_bridge.imgmsg_to_cv2(
                 self.latest_image, desired_encoding='passthrough'
             )
@@ -170,17 +167,15 @@ class PersonCounter(Node):
             if len(cv_image.shape) == 2 or (len(cv_image.shape) == 3 and cv_image.shape[2] == 1):
                 cv_image = cv2.cvtColor(cv_image, cv2.COLOR_GRAY2BGR)
 
-            # YOLO 추론
             results = self.yolo.predict(
                 source=cv_image,
                 verbose=False,
                 stream=False,
                 conf=self.threshold,
                 device=self.device,
-                classes=[0],  # person class만
+                classes=[0],  # person class
             )
 
-            # person 수 카운트
             count = 0
             if results and len(results) > 0:
                 boxes = results[0].boxes
@@ -189,14 +184,11 @@ class PersonCounter(Node):
 
             self.person_count = count
 
-            # 실시간 퍼블리시
             msg = Int32(); msg.data = count
             self.pub_count.publish(msg)
 
-            # 안정화 로직: 감지 수가 5초 이상 유지되면 stable count 갱신
             now = time.time()
             if count != self._pending_count:
-                # 새로운 count 값이 감지되면 pending 시작
                 self._pending_count = count
                 self._pending_since = now
             else:
@@ -209,10 +201,8 @@ class PersonCounter(Node):
                         self.get_logger().warning(f"확정 카운트 갱신: {old_stable} → {self.stable_count} (변화량: {diff:+d})")
                         if diff < 0:
                             self._trigger_bounce()
-                    # 변화 반영 후 pending 초기화
                     self._pending_since = None
 
-            # 확정 카운트 퍼블리시
             msg_stable = Int32(); msg_stable.data = self.stable_count
             self.pub_count_stable.publish(msg_stable)
 
@@ -232,7 +222,6 @@ class PersonCounter(Node):
         msg.pose.position.y = float(target_y)
         msg.pose.position.z = float(target_z)
 
-        # yaw만 반영 (roll, pitch=0)
         cy = math.cos(target_yaw * 0.5)
         sy = math.sin(target_yaw * 0.5)
         msg.pose.orientation.z = sy
@@ -246,7 +235,6 @@ class PersonCounter(Node):
         )
 
     def _finish_bounce(self, target_height: float):
-        # 하강 명령 후 타이머 해제
         self._send_goto(0, 0, target_height, 0)
         self.get_logger().warning(f"stable 감소 대응: 하강 → {target_height:.2f} m")
         if self._bounce_timer is not None:
@@ -263,7 +251,6 @@ class PersonCounter(Node):
         base = max(0.1, float(self.takeoff_height))
         up = max(0.1, base + self.bounce_delta)
 
-        # 즉시 상승 후, 1초 뒤 하강
         self._send_goto(0, 0, up, 0)
 
         self.get_logger().warning(f"stable 감소 대응: 상승 → {up:.2f} m (기준 {base:.2f} m)")
